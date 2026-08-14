@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/notiz-core",
+  "crates/notiz-storage",
+  "crates/notiz-services",
+  "crates/notiz-ui",
+  "crates/notiz-app",
+]
+default-members = ["crates/notiz-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+iced = { version = "0.14.0", default-features = false, features = [
+  "advanced",
+  "canvas",
+  "crisp",
+  "highlighter",
+  "linux-theme-detection",
+  "markdown",
+  "thread-pool",
+  "tokio",
+  "wayland",
+  "web-colors",
+  "wgpu",
+] }
+iced_lucide = "0.1.0"
+iced_selection = { version = "0.5.0", features = ["markdown"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Notiz
+Comment=Markdown notes and knowledge graph
+Exec=notiz
+Icon=notiz
+Terminal=false
+Type=Application
+Categories=Office;Utility;
+Keywords=notes;markdown;knowledge;graph;
+StartupWMClass=dev.notiz.Notiz
+

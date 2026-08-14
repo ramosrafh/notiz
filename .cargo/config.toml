@@ -1,0 +1,4 @@
+[env]
+WINIT_UNIX_BACKEND = { value = "wayland", force = true }
+WGPU_BACKEND = { value = "vulkan", force = false }
+

@@ -1,0 +1,16 @@
+[package]
+name = "notiz-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+iced.workspace = true
+iced_lucide.workspace = true
+iced_selection.workspace = true
+notiz-core = { path = "../notiz-core" }
+notiz-services = { path = "../notiz-services" }
+tokio.workspace = true
+uuid.workspace = true

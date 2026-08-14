@@ -1,0 +1,11 @@
+[package]
+name = "notiz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+notiz-services = { path = "../notiz-services" }
+notiz-ui = { path = "../notiz-ui" }
+
