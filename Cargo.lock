@@ -2051,6 +2051,7 @@ dependencies = [
  "iced_selection",
  "notiz-core",
  "notiz-services",
+ "pulldown-cmark",
  "tokio",
  "uuid",
 ]

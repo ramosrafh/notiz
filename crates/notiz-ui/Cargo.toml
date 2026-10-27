@@ -12,5 +12,6 @@ iced_lucide.workspace = true
 iced_selection.workspace = true
 notiz-core = { path = "../notiz-core" }
 notiz-services = { path = "../notiz-services" }
+pulldown-cmark.workspace = true
 tokio.workspace = true
 uuid.workspace = true

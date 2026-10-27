@@ -7,7 +7,7 @@ use iced::{Color, Element, Font, Length, Point, Rectangle, Renderer, Theme, Vect
 use notiz_core::KnowledgeGraph;
 use uuid::Uuid;
 
-use crate::theme::{BACKGROUND, BORDER, INDIGO_LIGHT, MUTED, SURFACE, TEXT};
+use crate::theme::{BACKGROUND, BORDER, INDIGO, INDIGO_LIGHT, MUTED, SURFACE, TEXT};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -50,11 +50,18 @@ impl canvas::Program<Message> for GraphProgram<'_> {
         let position = cursor.position_in(bounds);
         match event {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) if position.is_some() => {
-                let y = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+                let exponent = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y * 0.28,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y * 0.007,
                 };
-                state.scale = (state.scale * (1.0 + y * 0.10)).clamp(0.35, 4.0);
+                let old_scale = state.scale;
+                let new_scale = (old_scale * exponent.exp()).clamp(0.20, 7.0);
+                let cursor = position.expect("wheel position was checked");
+                let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+                let cursor_from_center = Vector::new(cursor.x, cursor.y) - center;
+                let ratio = new_scale / old_scale;
+                state.offset = cursor_from_center - (cursor_from_center - state.offset) * ratio;
+                state.scale = new_scale;
                 Some(canvas::Action::capture())
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -119,7 +126,7 @@ impl canvas::Program<Message> for GraphProgram<'_> {
             frame.stroke(
                 &line,
                 canvas::Stroke::default()
-                    .with_color(Color::from_rgba(0.55, 0.52, 0.75, 0.32))
+                    .with_color(Color::from_rgba(0.63, 0.63, 0.63, 0.32))
                     .with_width(1.2),
             );
         }
@@ -135,7 +142,7 @@ impl canvas::Program<Message> for GraphProgram<'_> {
                 (6.0 + (node.degree as f32 + 1.0).sqrt() * 1.8) * if active { 1.25 } else { 1.0 };
             let halo = canvas::Path::circle(position, radius + 5.0);
             if active || hovered {
-                frame.fill(&halo, Color::from_rgba(0.40, 0.35, 0.95, 0.18));
+                frame.fill(&halo, Color { a: 0.18, ..INDIGO });
             }
             let circle = canvas::Path::circle(position, radius);
             frame.fill(&circle, if active { INDIGO_LIGHT } else { SURFACE });

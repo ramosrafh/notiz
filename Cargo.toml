@@ -33,6 +33,7 @@ iced = { version = "0.14.0", default-features = false, features = [
 ] }
 iced_lucide = "0.1.0"
 iced_selection = { version = "0.5.0", features = ["markdown"] }
+pulldown-cmark = "0.12.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

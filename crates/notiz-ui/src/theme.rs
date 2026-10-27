@@ -1,18 +1,20 @@
 use iced::widget::{button, container, text_input};
 use iced::{Background, Border, Color, Shadow, Theme};
 
-pub const BACKGROUND: Color = Color::from_rgb(0.035, 0.035, 0.043);
-pub const SIDEBAR: Color = Color::from_rgb(0.026, 0.026, 0.033);
-pub const SURFACE: Color = Color::from_rgb(0.082, 0.082, 0.10);
-pub const SURFACE_HOVER: Color = Color::from_rgb(0.12, 0.12, 0.145);
-pub const BORDER: Color = Color::from_rgb(0.15, 0.15, 0.18);
-pub const TEXT: Color = Color::from_rgb(0.90, 0.90, 0.93);
-pub const MUTED: Color = Color::from_rgb(0.56, 0.56, 0.63);
-pub const DIM: Color = Color::from_rgb(0.40, 0.40, 0.47);
-pub const INDIGO: Color = Color::from_rgb(0.40, 0.35, 0.95);
-pub const INDIGO_LIGHT: Color = Color::from_rgb(0.59, 0.62, 1.0);
-pub const SUCCESS: Color = Color::from_rgb(0.20, 0.83, 0.60);
-pub const DANGER: Color = Color::from_rgb(0.94, 0.30, 0.32);
+pub const BACKGROUND: Color = Color::from_rgb8(0x10, 0x10, 0x10);
+pub const SIDEBAR: Color = SURFACE;
+pub const SURFACE: Color = Color::from_rgb8(0x16, 0x16, 0x16);
+pub const SURFACE_HOVER: Color = Color::from_rgb8(0x23, 0x23, 0x23);
+pub const SURFACE_ACTIVE: Color = Color::from_rgb8(0x28, 0x28, 0x28);
+pub const BORDER: Color = Color::from_rgb8(0x34, 0x34, 0x34);
+pub const TEXT: Color = Color::from_rgb8(0xFF, 0xFF, 0xFF);
+pub const MUTED: Color = Color::from_rgb8(0xA0, 0xA0, 0xA0);
+pub const DIM: Color = Color::from_rgb8(0x70, 0x70, 0x70);
+pub const DISABLED: Color = Color::from_rgb8(0x50, 0x50, 0x50);
+pub const INDIGO: Color = Color::from_rgb8(0xFF, 0xC7, 0x99);
+pub const INDIGO_LIGHT: Color = INDIGO;
+pub const SUCCESS: Color = Color::from_rgb8(0x99, 0xFF, 0xE4);
+pub const DANGER: Color = Color::from_rgb8(0xFF, 0x80, 0x80);
 
 pub fn panel(background: Color, border: Color, radius: f32) -> container::Style {
     container::Style {
@@ -34,7 +36,7 @@ pub fn panel(background: Color, border: Color, radius: f32) -> container::Style 
 
 pub fn note_button(active: bool, status: button::Status) -> button::Style {
     let background = if active {
-        Color::from_rgba(0.40, 0.35, 0.95, 0.20)
+        Color::from_rgba(1.0, 0.78, 0.60, 0.20)
     } else if matches!(status, button::Status::Hovered) {
         SURFACE_HOVER
     } else {
@@ -55,17 +57,20 @@ pub fn note_button(active: bool, status: button::Status) -> button::Style {
 
 pub fn note_surface(
     active: bool,
+    nested: bool,
     hovered: bool,
     dragging: bool,
     drag_progress: f32,
 ) -> container::Style {
     panel(
         if dragging {
-            Color::from_rgba(0.40, 0.35, 0.95, 0.10 + drag_progress * 0.14)
+            Color::from_rgba(1.0, 0.78, 0.60, 0.10 + drag_progress * 0.14)
         } else if active {
-            Color::from_rgba(0.40, 0.35, 0.95, 0.16)
+            SURFACE_ACTIVE
         } else if hovered {
             SURFACE_HOVER
+        } else if nested {
+            SURFACE
         } else {
             Color::TRANSPARENT
         },
@@ -78,6 +83,37 @@ pub fn note_surface(
             Color::TRANSPARENT
         },
         8.0,
+    )
+}
+
+pub fn folder_surface(
+    selected: bool,
+    expanded: bool,
+    hovered: bool,
+    dragging: bool,
+    drag_progress: f32,
+) -> container::Style {
+    panel(
+        if dragging {
+            Color::from_rgba(1.0, 0.78, 0.60, 0.08 + drag_progress * 0.12)
+        } else if hovered {
+            SURFACE_HOVER
+        } else if selected {
+            SURFACE_ACTIVE
+        } else if expanded {
+            SURFACE
+        } else {
+            Color::TRANSPARENT
+        },
+        if dragging {
+            Color {
+                a: 0.30 + drag_progress * 0.60,
+                ..INDIGO_LIGHT
+            }
+        } else {
+            Color::TRANSPARENT
+        },
+        7.0,
     )
 }
 
@@ -127,7 +163,7 @@ pub fn palette_item(active: bool, status: button::Status) -> button::Style {
         text_color: TEXT,
         border: Border {
             color: if active {
-                Color::from_rgb(0.24, 0.24, 0.29)
+                SURFACE_ACTIVE
             } else {
                 Color::TRANSPARENT
             },
@@ -141,18 +177,15 @@ pub fn palette_item(active: bool, status: button::Status) -> button::Style {
 
 pub fn ghost_button(_theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
-        background: Some(Background::Color(
-            if matches!(status, button::Status::Hovered) {
-                SURFACE_HOVER
-            } else {
-                Color::TRANSPARENT
-            },
-        )),
-        text_color: TEXT,
+        background: matches!(status, button::Status::Hovered).then_some(Background::Color(SURFACE)),
+        text_color: if matches!(status, button::Status::Hovered) {
+            TEXT
+        } else {
+            MUTED
+        },
         border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 8.0.into(),
+            radius: 10.0.into(),
+            ..Border::default()
         },
         shadow: Shadow::default(),
         snap: true,
@@ -168,7 +201,7 @@ pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
                 INDIGO
             },
         )),
-        text_color: Color::WHITE,
+        text_color: BACKGROUND,
         border: Border {
             radius: 8.0.into(),
             ..Border::default()
@@ -182,14 +215,14 @@ pub fn danger_button(_theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
         background: Some(Background::Color(
             if matches!(status, button::Status::Hovered) {
-                Color::from_rgba(0.94, 0.30, 0.32, 0.20)
+                Color::from_rgba(1.0, 0.50, 0.50, 0.20)
             } else {
                 Color::TRANSPARENT
             },
         )),
         text_color: DANGER,
         border: Border {
-            color: Color::from_rgba(0.94, 0.30, 0.32, 0.45),
+            color: Color::from_rgba(1.0, 0.50, 0.50, 0.45),
             width: 1.0,
             radius: 8.0.into(),
         },
@@ -201,23 +234,39 @@ pub fn danger_button(_theme: &Theme, status: button::Status) -> button::Style {
 pub fn input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: Background::Color(SURFACE),
+        background: Background::Color(BACKGROUND),
         border: Border {
             color: if focused { INDIGO } else { BORDER },
             width: 1.0,
             radius: 8.0.into(),
         },
         icon: MUTED,
-        placeholder: DIM,
+        placeholder: DISABLED,
         value: TEXT,
-        selection: Color::from_rgba(0.40, 0.35, 0.95, 0.45),
+        selection: Color::from_rgba(1.0, 0.78, 0.60, 0.45),
+    }
+}
+
+pub fn inline_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused { .. });
+    text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border {
+            color: if focused { INDIGO } else { Color::TRANSPARENT },
+            width: 1.0,
+            radius: 7.0.into(),
+        },
+        icon: MUTED,
+        placeholder: DISABLED,
+        value: TEXT,
+        selection: Color::from_rgba(1.0, 0.78, 0.60, 0.45),
     }
 }
 
 pub fn palette_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: Background::Color(SURFACE),
+        background: Background::Color(BACKGROUND),
         border: Border {
             color: if focused {
                 Color::from_rgb(0.30, 0.30, 0.36)
@@ -228,8 +277,8 @@ pub fn palette_input(_theme: &Theme, status: text_input::Status) -> text_input::
             radius: 8.0.into(),
         },
         icon: MUTED,
-        placeholder: DIM,
+        placeholder: DISABLED,
         value: TEXT,
-        selection: Color::from_rgba(0.45, 0.45, 0.52, 0.40),
+        selection: Color::from_rgba(1.0, 0.78, 0.60, 0.40),
     }
 }

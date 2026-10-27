@@ -21,6 +21,59 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteTemplate {
+    Daily,
+    Session,
+    Memory,
+}
+
+impl NoteTemplate {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "Diário",
+            Self::Session => "Sessão",
+            Self::Memory => "Memória",
+        }
+    }
+
+    /// Uses the local calendar date for date-based titles.
+    pub fn default_title(self) -> String {
+        self.title_on(chrono::Local::now().date_naive())
+    }
+
+    fn title_on(self, date: chrono::NaiveDate) -> String {
+        match self {
+            Self::Daily => date.to_string(),
+            Self::Session => format!("Sessão {date}"),
+            Self::Memory => "Nova memória".into(),
+        }
+    }
+
+    fn folder(self) -> &'static str {
+        match self {
+            Self::Daily => "Daily",
+            Self::Session => "Sessions",
+            Self::Memory => "Memory",
+        }
+    }
+
+    fn body(self, title: &str) -> String {
+        let sections = match self {
+            Self::Daily => {
+                "## Prioridades\n\n- [ ] \n\n## Registro do dia\n\n\n## Sessões e notas relacionadas\n\n\n## Aprendizados e próximos passos"
+            }
+            Self::Session => {
+                "## Objetivo\n\n\n## Contexto e referências\n\n\n## Notas da sessão\n\n\n## Decisões\n\n\n## Próximos passos\n\n- [ ] \n\n## Memórias a preservar"
+            }
+            Self::Memory => {
+                "## Conhecimento a preservar\n\n\n## Contexto\n\n\n## Fontes e notas relacionadas\n\n\n## Aplicação e revisão"
+            }
+        };
+        format!("# {title}\n\n{sections}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
     pub notes: Vec<NoteSummary>,
@@ -122,6 +175,59 @@ impl AppServices {
                 note,
                 backlinks: Vec::new(),
             },
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    /// Creates a template note, or opens the existing daily note for today.
+    pub fn create_note_from_template(&self, template: NoteTemplate) -> Result<MutationResult> {
+        self.create_note_from_template_on(template, chrono::Local::now().date_naive())
+    }
+
+    fn create_note_from_template_on(
+        &self,
+        template: NoteTemplate,
+        date: chrono::NaiveDate,
+    ) -> Result<MutationResult> {
+        let title = template.title_on(date);
+        let date_tag = format!("date-{date}");
+        if template == NoteTemplate::Daily {
+            // Refresh the index so an existing file is reused even with a new cache.
+            // The date tag keeps daily identity stable when its title is edited.
+            let path = format!("Daily/{date}.md");
+            let existing = self.vault.reindex()?.into_iter().find(|note| {
+                note.relative_path == path
+                    || (note
+                        .relative_path
+                        .rsplit_once('/')
+                        .map(|(folder, _)| folder)
+                        == Some("Daily")
+                        && (note.title == title
+                            || (note.tags.iter().any(|tag| tag == "daily")
+                                && note.tags.contains(&date_tag))))
+            });
+            if let Some(note) = existing {
+                return Ok(MutationResult {
+                    context: self.load_note(note.id)?,
+                    snapshot: self.current_snapshot()?,
+                });
+            }
+        }
+
+        let mut note = self.vault.create_note_in(&title, template.folder())?;
+        note.body = template.body(&title);
+        note.tags = vec![match template {
+            NoteTemplate::Daily => "daily".into(),
+            NoteTemplate::Session => "session".into(),
+            NoteTemplate::Memory => "memory".into(),
+        }];
+        if template == NoteTemplate::Daily {
+            note.tags.push(date_tag);
+        }
+        self.vault.save_note(&mut note)?;
+        let backlinks = self.vault.backlinks(note.id)?;
+        Ok(MutationResult {
+            context: NoteContext { note, backlinks },
             snapshot: self.current_snapshot()?,
         })
     }
@@ -337,6 +443,176 @@ fn force_layout(graph: &mut KnowledgeGraph) {
 mod tests {
     use super::*;
     use notiz_core::{GraphEdge, GraphNode};
+
+    struct TestVault(PathBuf);
+
+    impl TestVault {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("notiz-services-{}", Uuid::new_v4())))
+        }
+
+        fn open(&self, index: &str) -> AppServices {
+            AppServices::open(self.0.join("vault"), self.0.join(index)).unwrap()
+        }
+    }
+
+    impl Drop for TestVault {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn template_labels_and_default_titles_are_useful() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 27).unwrap();
+        assert_eq!(NoteTemplate::Daily.label(), "Diário");
+        assert_eq!(NoteTemplate::Session.label(), "Sessão");
+        assert_eq!(NoteTemplate::Memory.label(), "Memória");
+        assert_eq!(NoteTemplate::Daily.title_on(date), "2026-10-27");
+        assert_eq!(NoteTemplate::Session.title_on(date), "Sessão 2026-10-27");
+        assert_eq!(NoteTemplate::Memory.default_title(), "Nova memória");
+    }
+
+    #[test]
+    fn templates_persist_markdown_tags_and_folders() {
+        let directory = TestVault::new();
+        let services = directory.open("index.sqlite3");
+        for (template, folder, tag, section) in [
+            (NoteTemplate::Daily, "Daily", "daily", "## Prioridades"),
+            (NoteTemplate::Session, "Sessions", "session", "## Decisões"),
+            (
+                NoteTemplate::Memory,
+                "Memory",
+                "memory",
+                "## Fontes e notas relacionadas",
+            ),
+        ] {
+            let result = services.create_note_from_template(template).unwrap();
+            let note = &result.context.note;
+            assert!(note.relative_path.starts_with(&format!("{folder}/")));
+            assert!(note.body.starts_with(&format!("# {}\n\n", note.title)));
+            assert!(note.body.contains(section));
+            assert!(note.tags.iter().any(|value| value == tag));
+            assert!(result.snapshot.folders.contains(&folder.to_owned()));
+            assert!(
+                result
+                    .snapshot
+                    .notes
+                    .iter()
+                    .any(|entry| entry.id == note.id)
+            );
+            assert_eq!(services.load_note(note.id).unwrap().note, *note);
+            assert!(
+                services
+                    .search(tag)
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.id == note.id)
+            );
+        }
+        assert_eq!(services.refresh().unwrap().notes.len(), 3);
+    }
+
+    #[test]
+    fn daily_reopens_without_overwriting_edits_even_with_a_new_index() {
+        let directory = TestVault::new();
+        let services = directory.open("index.sqlite3");
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 27).unwrap();
+        let first = services
+            .create_note_from_template_on(NoteTemplate::Daily, date)
+            .unwrap();
+        let note = first.context.note;
+        let saved = services
+            .save_note(
+                note.clone(),
+                note.title.clone(),
+                "# Registro\n\nConteúdo escrito pelo usuário.".into(),
+                "daily pessoal".into(),
+            )
+            .unwrap()
+            .context
+            .note;
+        let path = services.vault_path().join(&saved.relative_path);
+        let original_file = std::fs::read(&path).unwrap();
+        // Also verify that opening returns backlinks rather than a creation-only context.
+        let source = services
+            .create_note("Referência ao diário")
+            .unwrap()
+            .context
+            .note;
+        services
+            .save_note(
+                source,
+                "Referência ao diário".into(),
+                format!("[[{}]]", saved.title),
+                String::new(),
+            )
+            .unwrap();
+        let reopened_services = directory.open("new-index.sqlite3");
+        let reopened = reopened_services
+            .create_note_from_template_on(NoteTemplate::Daily, date)
+            .unwrap();
+        assert_eq!(reopened.context.note, saved);
+        assert_eq!(reopened.context.backlinks.len(), 1);
+        assert_eq!(reopened.snapshot.notes.len(), 2);
+        assert_eq!(std::fs::read(path).unwrap(), original_file);
+        assert!(!services.vault_path().join("Daily/2026-10-27-2.md").exists());
+    }
+
+    #[test]
+    fn daily_reuses_a_renamed_note_and_keeps_different_days_separate() {
+        let directory = TestVault::new();
+        let services = directory.open("index.sqlite3");
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 27).unwrap();
+        let note = services
+            .create_note_from_template_on(NoteTemplate::Daily, date)
+            .unwrap()
+            .context
+            .note;
+        let saved = services
+            .save_note(
+                note.clone(),
+                "Meu dia".into(),
+                note.body.clone(),
+                note.tags.join(","),
+            )
+            .unwrap()
+            .context
+            .note;
+        let reopened = services
+            .create_note_from_template_on(NoteTemplate::Daily, date)
+            .unwrap();
+        assert_eq!(reopened.context.note, saved);
+        assert_eq!(reopened.snapshot.notes.len(), 1);
+        let tomorrow = services
+            .create_note_from_template_on(NoteTemplate::Daily, date.succ_opt().unwrap())
+            .unwrap();
+        assert_ne!(tomorrow.context.note.id, saved.id);
+        assert_eq!(tomorrow.context.note.title, "2026-10-28");
+        assert_eq!(tomorrow.snapshot.notes.len(), 2);
+    }
+
+    #[test]
+    fn session_and_memory_templates_create_distinct_notes() {
+        let directory = TestVault::new();
+        let services = directory.open("index.sqlite3");
+        for template in [NoteTemplate::Session, NoteTemplate::Memory] {
+            let first = services
+                .create_note_from_template(template)
+                .unwrap()
+                .context
+                .note;
+            let second = services
+                .create_note_from_template(template)
+                .unwrap()
+                .context
+                .note;
+            assert_ne!(first.id, second.id);
+            assert_ne!(first.relative_path, second.relative_path);
+            assert_eq!(services.load_note(first.id).unwrap().note, first);
+        }
+        assert_eq!(services.refresh().unwrap().notes.len(), 4);
+    }
 
     #[test]
     fn tags_are_normalized_and_deduplicated() {

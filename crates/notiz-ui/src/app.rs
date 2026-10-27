@@ -1,26 +1,26 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    path::Path,
-    time::Duration,
-};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 use iced::widget::{
-    Space, button, checkbox, column, container, markdown, mouse_area, opaque, pick_list, row,
-    scrollable, stack, text, text_editor, text_input,
+    Space, button, checkbox, column, container, markdown, mouse_area, opaque, pin, row, scrollable,
+    stack, text, text_editor, text_input, tooltip,
 };
 use iced::{
-    Background, Border, Color, Element, Fill, Font, Padding, Subscription, Task, Theme, mouse, time,
+    Background, Border, Color, Element, Fill, Font, Padding, Subscription, Task, Theme, mouse,
+    theme::Palette, time,
 };
 use notiz_core::{Backlink, KnowledgeGraph, Note, NoteSummary, renderable_markdown};
 use notiz_services::{
     AppServices, AppSnapshot, DeleteResult, FolderMutationResult, MutationResult, NoteContext,
+    NoteTemplate,
 };
 use uuid::Uuid;
 
 use crate::graph;
 use crate::searchable_markdown;
+use crate::selectable_preview;
 use crate::theme::{
-    self, BACKGROUND, BORDER, DIM, INDIGO_LIGHT, MUTED, SIDEBAR, SUCCESS, SURFACE, TEXT,
+    self, BACKGROUND, BORDER, DANGER, DIM, INDIGO, INDIGO_LIGHT, MUTED, SIDEBAR, SUCCESS, SURFACE,
+    TEXT,
 };
 
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
@@ -28,15 +28,16 @@ const SIDEBAR_MIN_WIDTH: f32 = 240.0;
 const SIDEBAR_MAX_WIDTH: f32 = 540.0;
 const SIDEBAR_COLLAPSED_WIDTH: f32 = 62.0;
 const SIDEBAR_RESIZE_WIDTH: f32 = 5.0;
+const TREE_INDENT: f32 = 18.0;
+const TREE_LEADING_WIDTH: f32 = 40.0;
+const TREE_ACTION_WIDTH: f32 = 28.0;
+const TREE_ROW_PADDING_X: u16 = 8;
 const INSPECTOR_WIDTH: f32 = 280.0;
 const INSPECTOR_COLLAPSED_WIDTH: f32 = 56.0;
-const TREE_FOLDER_TRAVEL: f32 = 41.0;
-const TREE_NOTE_TRAVEL: f32 = 57.0;
-const TREE_REORDER_THRESHOLD: f32 = 0.62;
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
 const PREVIEW_DELAY: Duration = Duration::from_millis(140);
-const UI_FONT: Font = Font::DEFAULT;
-const CODE_FONT: Font = Font::MONOSPACE;
+const UI_FONT: Font = Font::with_name("Inter");
+const CODE_FONT: Font = Font::with_name("JetBrains Mono");
 
 pub fn run(services: AppServices) -> iced::Result {
     iced::application(
@@ -48,12 +49,15 @@ pub fn run(services: AppServices) -> iced::Result {
     .theme(Notiz::theme)
     .subscription(Notiz::subscription)
     .font(iced_lucide::FONT_BYTES)
+    .font(include_bytes!("../../../assets/fonts/inter-variable.ttf").as_slice())
+    .font(include_bytes!("../../../assets/fonts/jetbrains-mono-variable.ttf").as_slice())
     .default_font(UI_FONT)
     .antialiasing(true)
     .window(iced::window::Settings {
         size: iced::Size::new(1360.0, 860.0),
         min_size: Some(iced::Size::new(880.0, 620.0)),
         position: iced::window::Position::Centered,
+        exit_on_close_request: false,
         platform_specific: iced::window::settings::PlatformSpecific {
             application_id: "dev.notiz.Notiz".into(),
             ..Default::default()
@@ -71,6 +75,21 @@ enum WorkspaceMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeSort {
+    Alphabetical,
+    Updated,
+}
+
+impl TreeSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Alphabetical => "A–Z",
+            Self::Updated => "Updated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceTab {
     Note(Uuid),
     Graph,
@@ -79,6 +98,7 @@ enum WorkspaceTab {
 #[derive(Debug, Clone)]
 enum PaletteAction {
     CreateNote,
+    CreateFromTemplate(NoteTemplate),
     OpenTree,
     OpenGraph,
     ToggleInspector,
@@ -98,7 +118,6 @@ struct PaletteEntry {
 struct PreviewBlock {
     start_line: usize,
     end_line: usize,
-    content: markdown::Content,
 }
 
 #[derive(Debug, Clone)]
@@ -170,11 +189,24 @@ enum TreeItem {
     Note(Uuid),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeContextTarget {
+    Root,
+    Folder(String),
+    Note(Uuid),
+}
+
+#[derive(Debug, Clone)]
+struct TreeContextMenu {
+    target: TreeContextTarget,
+    x: f32,
+    y: f32,
+}
+
 #[derive(Debug, Clone)]
 struct TreeDrag {
     item: TreeItem,
     origin_x: f32,
-    last_y: f32,
     active: bool,
 }
 
@@ -190,17 +222,20 @@ enum Message {
     Initialized(Result<AppSnapshot, String>),
     SearchChanged(String),
     SearchFinished(String, Result<Vec<NoteSummary>, String>),
-    ToggleFolderCreator,
+    CycleTreeSort,
+    OpenFolderCreator(String),
     FolderNameChanged(String),
     CreateFolderRequested,
     FolderCreated(Result<AppSnapshot, String>),
     CreateNote,
+    CreateNoteIn(String),
     NoteCreatorTitleChanged(String),
-    NoteCreatorFolderChanged(String),
-    CancelNoteCreator,
+    CancelCreators,
     ConfirmCreateNote,
+    CreateFromTemplate(NoteTemplate),
     Created(Result<MutationResult, String>),
     OpenNote(Uuid),
+    OpenHome,
     OpenGraph,
     SelectTab(WorkspaceTab),
     CloseTab(WorkspaceTab),
@@ -216,8 +251,6 @@ enum Message {
     SaveRequested,
     AutosaveTick,
     Saved(Uuid, u64, Result<MutationResult, String>),
-    DeleteRequested,
-    Deleted(Uuid, Result<DeleteResult, String>),
     HoverNote(Option<Uuid>),
     HoverFolder(Option<String>),
     HoverNoteSelector(Option<Uuid>),
@@ -226,6 +259,8 @@ enum Message {
     ToggleFolderExpanded(String),
     ToggleNoteSelection(Uuid),
     ToggleFolderSelection(String),
+    OpenTreeContext(TreeContextTarget),
+    DeleteTreeItem(TreeItem),
     DeleteSelection,
     SelectionDeleted(Vec<Uuid>, Vec<String>, Result<DeleteResult, String>),
     BeginTreeInteraction(TreeItem),
@@ -233,7 +268,6 @@ enum Message {
     EndTreeInteraction,
     TreeNoteMoved(Uuid, Result<MutationResult, String>),
     TreeFolderMoved(String, Result<FolderMutationResult, String>),
-    TreeOrderSaved(Result<AppSnapshot, String>),
     RefreshRequested,
     Refreshed(Result<AppSnapshot, String>),
     MarkdownLinkClicked(markdown::Uri),
@@ -246,6 +280,7 @@ enum Message {
     SidebarResizeEnd,
     TogglePalette,
     CloseOverlay,
+    CloseWindow(iced::window::Id),
     PaletteQueryChanged(String),
     PaletteMove(i32),
     PaletteSubmit,
@@ -254,7 +289,7 @@ enum Message {
     ToggleNoteSearch,
     NoteSearchChanged(String),
     NavigateNoteSearch(i32),
-    PreviewPrepared(u64, Vec<PreviewSource>),
+    PreviewPrepared(u64, Vec<PreviewSource>, selectable_preview::Document),
     ActivateWorkspaceMode(WorkspaceMode),
     FinishWorkspaceModePreparation(WorkspaceMode),
     ToggleVaultManager,
@@ -274,6 +309,7 @@ struct Notiz {
     folders: Vec<String>,
     visible_notes: Vec<NoteSummary>,
     search: String,
+    tree_sort: TreeSort,
     selected_folder: String,
     folder_creator_open: bool,
     folder_name: String,
@@ -286,16 +322,17 @@ struct Notiz {
     hovered_folder_selector: Option<String>,
     selected_notes: HashSet<Uuid>,
     selected_folders: HashSet<String>,
+    context_menu: Option<TreeContextMenu>,
     tree_hold: Option<TreeHold>,
     tree_drag: Option<TreeDrag>,
     tree_drop_target: Option<TreeItem>,
     tree_nest_target: Option<String>,
-    tree_reordered: bool,
     tree_drag_progress: f32,
     collapsed_folders: HashSet<String>,
     active_note: Option<Note>,
     editor: text_editor::Content,
     preview_blocks: Vec<PreviewBlock>,
+    preview_document: selectable_preview::Document,
     title: String,
     tags: String,
     backlinks: Vec<Backlink>,
@@ -332,8 +369,6 @@ struct Notiz {
     preview_dirty: bool,
     preview_building: bool,
     preview_job_revision: u64,
-    preview_queue: VecDeque<PreviewSource>,
-    preview_staging: Vec<PreviewBlock>,
     note_search_open: bool,
     note_search_query: String,
     note_search_matches: Vec<(usize, usize, usize)>,
@@ -345,6 +380,7 @@ struct Notiz {
     busy: bool,
     status: String,
     vault_revision: u64,
+    deferred_action: Option<Box<Message>>,
     external_checking: bool,
 }
 
@@ -364,28 +400,30 @@ impl Notiz {
                 folders: Vec::new(),
                 visible_notes: Vec::new(),
                 search: String::new(),
+                tree_sort: TreeSort::Alphabetical,
                 selected_folder: String::new(),
                 folder_creator_open: false,
                 folder_name: String::new(),
                 note_creator_open: false,
                 note_creator_title: String::new(),
-                note_creator_folder: "Root".into(),
+                note_creator_folder: String::new(),
                 hovered_note: None,
                 hovered_folder: None,
                 hovered_note_selector: None,
                 hovered_folder_selector: None,
                 selected_notes: HashSet::new(),
                 selected_folders: HashSet::new(),
+                context_menu: None,
                 tree_hold: None,
                 tree_drag: None,
                 tree_drop_target: None,
                 tree_nest_target: None,
-                tree_reordered: false,
                 tree_drag_progress: 0.0,
                 collapsed_folders: HashSet::new(),
                 active_note: None,
                 editor: text_editor::Content::new(),
                 preview_blocks: build_preview_blocks(""),
+                preview_document: selectable_preview::Document::parse("*Empty note.*"),
                 title: String::new(),
                 tags: String::new(),
                 backlinks: Vec::new(),
@@ -422,8 +460,6 @@ impl Notiz {
                 preview_dirty: false,
                 preview_building: false,
                 preview_job_revision: 0,
-                preview_queue: VecDeque::new(),
-                preview_staging: Vec::new(),
                 note_search_open: false,
                 note_search_query: String::new(),
                 note_search_matches: Vec::new(),
@@ -435,6 +471,7 @@ impl Notiz {
                 busy: true,
                 status: "Preparing the vault…".into(),
                 vault_revision: 0,
+                deferred_action: None,
                 external_checking: false,
             },
             initialize,
@@ -448,9 +485,6 @@ impl Notiz {
                     self.apply_snapshot(snapshot);
                     self.busy = false;
                     self.status = "Vault ready".into();
-                    if let Some(note) = self.notes.first() {
-                        return self.load_note_task(note.id);
-                    }
                 }
                 Err(error) => {
                     self.busy = false;
@@ -483,12 +517,28 @@ impl Notiz {
                     }
                 }
             }
-            Message::ToggleFolderCreator => {
-                self.folder_creator_open = !self.folder_creator_open;
+            Message::CycleTreeSort => {
+                self.tree_sort = match self.tree_sort {
+                    TreeSort::Alphabetical => TreeSort::Updated,
+                    TreeSort::Updated => TreeSort::Alphabetical,
+                };
+                self.status = match self.tree_sort {
+                    TreeSort::Alphabetical => "Tree sorted alphabetically".into(),
+                    TreeSort::Updated => "Tree sorted by latest update".into(),
+                };
+            }
+            Message::OpenFolderCreator(folder) => {
+                self.context_menu = None;
+                self.note_creator_open = false;
+                self.note_creator_title.clear();
+                self.folder_creator_open = true;
+                self.selected_folder = folder;
                 self.folder_name.clear();
-                if self.folder_creator_open {
-                    return iced::widget::operation::focus(folder_input_id());
+                if self.sidebar_collapsed {
+                    self.sidebar_collapsed = false;
+                    self.sidebar_target = self.sidebar_expanded_width;
                 }
+                return iced::widget::operation::focus(folder_input_id());
             }
             Message::FolderNameChanged(name) => self.folder_name = name,
             Message::CreateFolderRequested => {
@@ -518,24 +568,27 @@ impl Notiz {
                 Err(error) => self.status = error,
             },
             Message::CreateNote => {
+                return self.update(Message::CreateNoteIn(self.selected_folder.clone()));
+            }
+            Message::CreateNoteIn(folder) => {
                 self.palette_open = false;
+                self.context_menu = None;
+                self.folder_creator_open = false;
+                self.folder_name.clear();
                 self.note_creator_open = true;
                 self.note_creator_title.clear();
-                self.note_creator_folder = if self.selected_folder.is_empty() {
-                    "Root".into()
-                } else {
-                    self.selected_folder.clone()
-                };
+                self.note_creator_folder = folder;
                 return iced::widget::operation::focus(note_creator_title_id());
             }
             Message::NoteCreatorTitleChanged(title) => self.note_creator_title = title,
-            Message::NoteCreatorFolderChanged(folder) => self.note_creator_folder = folder,
-            Message::CancelNoteCreator => {
-                self.note_creator_open = false;
-                self.note_creator_title.clear();
-                self.note_creator_folder = "Root".into();
-            }
+            Message::CancelCreators => return self.update(Message::CloseOverlay),
             Message::ConfirmCreateNote => {
+                if self.busy {
+                    return Task::none();
+                }
+                if let Some(task) = self.save_before(Message::ConfirmCreateNote) {
+                    return task;
+                }
                 let title = self.note_creator_title.trim();
                 if title.is_empty() {
                     return Task::none();
@@ -543,33 +596,30 @@ impl Notiz {
                 self.busy = true;
                 self.note_creator_open = false;
                 self.status = "Creating note…".into();
-                let pending = self.active_note.clone().filter(|_| self.dirty).map(|note| {
-                    (
-                        note,
-                        self.title.clone(),
-                        self.editor.text(),
-                        self.tags.clone(),
-                    )
-                });
-                let services = self.services.clone();
-                let folder = if self.note_creator_folder == "Root" {
-                    String::new()
-                } else {
-                    self.note_creator_folder.clone()
-                };
+                let folder = self.note_creator_folder.clone();
                 let title = title.to_owned();
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            if let Some((note, title, body, tags)) = pending {
-                                services.save_note(note, title, body, tags)?;
-                            }
-                            services.create_note_in(&title, &folder)
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .map_err(|error| error.to_string())
-                    },
+                return service_task(
+                    self.services.clone(),
+                    move |services| services.create_note_in(&title, &folder),
+                    Message::Created,
+                );
+            }
+            Message::CreateFromTemplate(template) => {
+                if self.busy {
+                    return Task::none();
+                }
+                if let Some(task) = self.save_before(Message::CreateFromTemplate(template)) {
+                    return task;
+                }
+                self.palette_open = false;
+                self.context_menu = None;
+                self.note_creator_open = false;
+                self.folder_creator_open = false;
+                self.busy = true;
+                self.status = format!("Opening {}…", template.label());
+                return service_task(
+                    self.services.clone(),
+                    move |services| services.create_note_from_template(template),
                     Message::Created,
                 );
             }
@@ -587,37 +637,51 @@ impl Notiz {
                 }
             }
             Message::OpenNote(id) => {
-                self.open_note_tab(id);
-                if self.active_note.as_ref().is_some_and(|note| note.id == id) {
+                if self.busy || self.active_note.as_ref().is_some_and(|note| note.id == id) {
+                    if !self.busy {
+                        self.open_note_tab(id);
+                    }
                     return Task::none();
                 }
-                let save = self.save_task();
-                let load = self.load_note_task(id);
-                return Task::batch([save, load]);
+                if let Some(task) = self.save_before(Message::OpenNote(id)) {
+                    return task;
+                }
+                return self.load_note_task(id);
             }
             Message::Loaded(id, result) => {
                 self.busy = false;
                 match result {
                     Ok(context) if context.note.id == id => {
-                        self.open_note_tab(id);
-                        self.apply_context(context);
-                        self.mode = WorkspaceMode::Preview;
-                        self.status = "Note loaded".into();
+                        if self.active_tab == Some(WorkspaceTab::Note(id)) {
+                            self.open_note_tab(id);
+                            self.apply_context(context);
+                            self.mode = WorkspaceMode::Preview;
+                            self.status = "Note loaded".into();
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => self.status = error,
                 }
             }
             Message::TitleChanged(title) => {
+                if self.busy {
+                    return Task::none();
+                }
                 self.title = title;
                 self.mark_dirty();
             }
             Message::TagsChanged(tags) => {
+                if self.busy {
+                    return Task::none();
+                }
                 self.tags = tags;
                 self.mark_dirty();
             }
             Message::EditorAction(action) => {
                 let edited = action.is_edit();
+                if edited && self.busy {
+                    return Task::none();
+                }
                 let scroll_lines = match &action {
                     text_editor::Action::Scroll { lines } => Some(*lines),
                     _ => None,
@@ -734,62 +798,18 @@ impl Notiz {
                             }
                         }
                         self.status = "Saved".into();
+                        if let Some(action) = self.deferred_action.take() {
+                            if let Some(task) = self.save_before(*action.clone()) {
+                                return task;
+                            }
+                            return self.update(*action);
+                        }
                     }
                     Err(error) => {
+                        self.deferred_action = None;
                         self.dirty = true;
                         self.status = format!("Could not save: {error}");
                     }
-                }
-            }
-            Message::DeleteRequested => {
-                let Some(note) = self.active_note.clone() else {
-                    return Task::none();
-                };
-                let id = note.id;
-                let title = self.title.clone();
-                let body = self.editor.text();
-                let tags = self.tags.clone();
-                let dirty = self.dirty;
-                self.busy = true;
-                self.status = "Moving note to Trash…".into();
-                let services = self.services.clone();
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            if dirty {
-                                services.save_note(note, title, body, tags)?;
-                            }
-                            services.delete_note(id)
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .map_err(|error| error.to_string())
-                    },
-                    move |result| Message::Deleted(id, result),
-                );
-            }
-            Message::Deleted(id, result) => {
-                self.busy = false;
-                match result {
-                    Ok(deleted) => {
-                        self.open_tabs.retain(|tab| *tab != WorkspaceTab::Note(id));
-                        self.apply_snapshot(deleted.snapshot);
-                        if let Some(context) = deleted.next {
-                            self.open_note_tab(context.note.id);
-                            self.apply_context(context);
-                        } else {
-                            self.active_note = None;
-                            self.editor = text_editor::Content::new();
-                            self.preview_blocks = build_preview_blocks("");
-                            self.title.clear();
-                            self.tags.clear();
-                            self.backlinks.clear();
-                            self.dirty = false;
-                            self.active_tab = self.open_tabs.last().copied();
-                        }
-                        self.status = "Note moved to Trash".into();
-                    }
-                    Err(error) => self.status = error,
                 }
             }
             Message::HoverNote(note) => {
@@ -825,6 +845,34 @@ impl Notiz {
                 if !self.selected_folders.insert(folder.clone()) {
                     self.selected_folders.remove(&folder);
                 }
+            }
+            Message::OpenTreeContext(target) => {
+                if let TreeContextTarget::Folder(folder) = &target {
+                    self.selected_folder = folder.clone();
+                } else if matches!(target, TreeContextTarget::Root) {
+                    self.selected_folder.clear();
+                }
+                self.context_menu = Some(TreeContextMenu {
+                    target,
+                    x: self.cursor_x,
+                    y: self.cursor_y,
+                });
+                self.folder_creator_open = false;
+                self.palette_open = false;
+            }
+            Message::DeleteTreeItem(item) => {
+                self.context_menu = None;
+                self.selected_notes.clear();
+                self.selected_folders.clear();
+                match item {
+                    TreeItem::Note(id) => {
+                        self.selected_notes.insert(id);
+                    }
+                    TreeItem::Folder(folder) => {
+                        self.selected_folders.insert(folder);
+                    }
+                }
+                return self.update(Message::DeleteSelection);
             }
             Message::DeleteSelection => {
                 if self.selected_notes.is_empty() && self.selected_folders.is_empty() {
@@ -942,7 +990,6 @@ impl Notiz {
                 self.tree_drag = None;
                 self.tree_drop_target = None;
                 self.tree_nest_target = None;
-                self.tree_reordered = false;
                 return Task::perform(
                     async move {
                         tokio::time::sleep(Duration::from_millis(180)).await;
@@ -965,7 +1012,6 @@ impl Notiz {
                     self.tree_drag = Some(TreeDrag {
                         item,
                         origin_x,
-                        last_y: self.cursor_y,
                         active: true,
                     });
                 }
@@ -999,13 +1045,6 @@ impl Notiz {
                     if let Some(id) = self.active_note.as_ref().map(|note| note.id) {
                         return self.load_note_task(id);
                     }
-                }
-                Err(error) => self.status = error,
-            },
-            Message::TreeOrderSaved(result) => match result {
-                Ok(snapshot) => {
-                    self.apply_snapshot(snapshot);
-                    self.status = "Tree order saved".into();
                 }
                 Err(error) => self.status = error,
             },
@@ -1047,12 +1086,21 @@ impl Notiz {
                 self.status = format!("External link: {uri}");
             }
             Message::LinkResolved(result) => match result {
-                Ok(Some(id)) => return self.load_note_task(id),
+                Ok(Some(id)) => return self.update(Message::OpenNote(id)),
                 Ok(None) => self.status = "No note matches this link yet".into(),
                 Err(error) => self.status = error,
             },
             Message::Graph(graph::Message::OpenNote(id)) => {
-                return self.load_note_task(id);
+                return self.update(Message::OpenNote(id));
+            }
+            Message::OpenHome => {
+                if self.busy {
+                    return Task::none();
+                }
+                if let Some(task) = self.save_before(Message::OpenHome) {
+                    return task;
+                }
+                self.active_tab = None;
             }
             Message::OpenGraph => {
                 self.open_tab(WorkspaceTab::Graph);
@@ -1066,15 +1114,18 @@ impl Notiz {
                         self.active_tab = Some(tab);
                         Task::none()
                     }
-                    WorkspaceTab::Note(id) => {
-                        self.active_tab = Some(tab);
-                        let save = self.save_task();
-                        let load = self.load_note_task(id);
-                        Task::batch([save, load])
-                    }
+                    WorkspaceTab::Note(id) => self.update(Message::OpenNote(id)),
                 };
             }
             Message::CloseTab(tab) => {
+                if self.busy {
+                    return Task::none();
+                }
+                if self.active_tab == Some(tab)
+                    && let Some(task) = self.save_before(Message::CloseTab(tab))
+                {
+                    return task;
+                }
                 if self.tab_hold == Some(tab) {
                     self.tab_hold = None;
                 }
@@ -1203,9 +1254,6 @@ impl Notiz {
                         }
                     }
                 }
-                if self.tree_drag.is_some() {
-                    self.reorder_tree_drag(y);
-                }
             }
             Message::SidebarResizeEnd => {
                 self.sidebar_resizing = false;
@@ -1224,10 +1272,22 @@ impl Notiz {
                     return iced::widget::operation::focus(palette_input_id());
                 }
             }
+            Message::CloseWindow(id) => {
+                if self.busy {
+                    return Task::none();
+                }
+                if let Some(task) = self.save_before(Message::CloseWindow(id)) {
+                    return task;
+                }
+                return iced::window::close(id);
+            }
             Message::CloseOverlay => {
+                self.context_menu = None;
+                self.folder_creator_open = false;
+                self.folder_name.clear();
                 self.note_creator_open = false;
                 self.note_creator_title.clear();
-                self.note_creator_folder = "Root".into();
+                self.note_creator_folder.clear();
                 self.palette_open = false;
                 self.palette_query.clear();
                 self.palette_selected = 0;
@@ -1236,6 +1296,7 @@ impl Notiz {
             Message::ToggleVaultManager => {
                 self.vault_manager_open = !self.vault_manager_open;
                 self.palette_open = false;
+                self.context_menu = None;
                 self.note_creator_open = false;
                 self.vault_path_draft = self.vault_path.clone();
                 if self.vault_manager_open {
@@ -1243,22 +1304,31 @@ impl Notiz {
                 }
             }
             Message::VaultPathChanged(path) => self.vault_path_draft = path,
-            Message::OpenVaultRequested => return self.switch_vault_task(false),
-            Message::CreateVaultRequested => return self.switch_vault_task(true),
-            Message::VaultSwitched(result) => match result {
-                Ok((services, snapshot)) => {
-                    self.services = services;
-                    self.vault_path = self.services.vault_path().display().to_string();
-                    self.vault_path_draft = self.vault_path.clone();
-                    self.vault_manager_open = false;
-                    self.reset_workspace_for_vault(snapshot);
-                    self.status = "Vault ready".into();
-                    if let Some(note) = self.notes.first() {
-                        return self.load_note_task(note.id);
-                    }
+            Message::OpenVaultRequested | Message::CreateVaultRequested => {
+                if self.busy || self.vault_path_draft.trim().is_empty() {
+                    return Task::none();
                 }
-                Err(error) => self.status = error,
-            },
+                let create = matches!(message, Message::CreateVaultRequested);
+                if let Some(task) = self.save_before(message) {
+                    return task;
+                }
+                self.busy = true;
+                return self.switch_vault_task(create);
+            }
+            Message::VaultSwitched(result) => {
+                self.busy = false;
+                match result {
+                    Ok((services, snapshot)) => {
+                        self.services = services;
+                        self.vault_path = self.services.vault_path().display().to_string();
+                        self.vault_path_draft = self.vault_path.clone();
+                        self.vault_manager_open = false;
+                        self.reset_workspace_for_vault(snapshot);
+                        self.status = "Vault ready".into();
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
             Message::PaletteQueryChanged(query) => {
                 self.palette_query = query;
                 self.palette_selected = 0;
@@ -1291,13 +1361,18 @@ impl Notiz {
                 self.palette_query.clear();
                 self.palette_selected = 0;
                 return match action {
-                    PaletteAction::CreateNote => self.update(Message::CreateNote),
+                    PaletteAction::CreateNote => {
+                        self.update(Message::CreateNoteIn(self.selected_folder.clone()))
+                    }
                     PaletteAction::OpenTree => {
                         if self.sidebar_collapsed {
                             self.sidebar_collapsed = false;
                             self.sidebar_target = self.sidebar_expanded_width;
                         }
                         Task::none()
+                    }
+                    PaletteAction::CreateFromTemplate(template) => {
+                        self.update(Message::CreateFromTemplate(template))
                     }
                     PaletteAction::OpenGraph => self.update(Message::OpenGraph),
                     PaletteAction::ToggleInspector => {
@@ -1354,11 +1429,14 @@ impl Notiz {
             Message::NavigateNoteSearch(delta) => {
                 return self.navigate_note_search(delta);
             }
-            Message::PreviewPrepared(revision, sources) => {
+            Message::PreviewPrepared(revision, sources, document) => {
                 if revision == self.revision {
                     self.preview_job_revision = revision;
-                    self.preview_queue = sources.into();
-                    self.preview_staging.clear();
+                    self.preview_blocks =
+                        sources.into_iter().map(preview_block_from_source).collect();
+                    self.preview_document = document;
+                    self.preview_building = false;
+                    self.preview_dirty = false;
                 } else {
                     self.preview_building = false;
                 }
@@ -1370,21 +1448,7 @@ impl Notiz {
                     0.30,
                 );
                 if self.preview_building && self.preview_job_revision != self.revision {
-                    self.preview_queue.clear();
-                    self.preview_staging.clear();
                     self.preview_building = false;
-                } else if !self.preview_queue.is_empty() {
-                    for _ in 0..3 {
-                        let Some(source) = self.preview_queue.pop_front() else {
-                            break;
-                        };
-                        self.preview_staging.push(preview_block_from_source(source));
-                    }
-                    if self.preview_queue.is_empty() {
-                        self.preview_blocks = std::mem::take(&mut self.preview_staging);
-                        self.preview_building = false;
-                        self.preview_dirty = false;
-                    }
                 }
                 animate_value(&mut self.sidebar_width, self.sidebar_target, 0.30);
                 animate_value(&mut self.inspector_width, self.inspector_target, 0.28);
@@ -1485,7 +1549,7 @@ impl Notiz {
                             if self.sidebar_resizing {
                                 INDIGO_LIGHT
                             } else {
-                                BORDER
+                                Color::TRANSPARENT
                             },
                             Color::TRANSPARENT,
                             0.0,
@@ -1496,17 +1560,32 @@ impl Notiz {
             .interaction(mouse::Interaction::ResizingHorizontally)
             .into()
         };
-        let base = row![
-            self.sidebar(),
-            resize_handle,
-            self.main_workspace(),
-            self.inspector_panel()
-        ]
+        let base: Element<'_, Message> = container(
+            row![
+                self.sidebar(),
+                resize_handle,
+                self.main_workspace(),
+                self.inspector_panel()
+            ]
+            .width(Fill)
+            .height(Fill),
+        )
         .width(Fill)
-        .height(Fill);
+        .height(Fill)
+        .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
+        .into();
 
-        if !self.palette_open && !self.note_creator_open && !self.vault_manager_open {
-            return base.into();
+        if !self.palette_open && !self.vault_manager_open {
+            if let Some(menu) = &self.context_menu {
+                let backdrop = mouse_area(container(Space::new()).width(Fill).height(Fill))
+                    .on_press(Message::CloseOverlay)
+                    .on_right_press(Message::CloseOverlay);
+                let x = menu.x.clamp(8.0, 1120.0);
+                let y = menu.y.clamp(8.0, 690.0);
+                let overlay = pin(opaque(self.tree_context_menu(&menu.target))).x(x).y(y);
+                return stack![base, backdrop, overlay].into();
+            }
+            return base;
         }
 
         let backdrop = mouse_area(container(Space::new()).width(Fill).height(Fill).style(|_| {
@@ -1516,10 +1595,9 @@ impl Notiz {
                 0.0,
             )
         }))
-        .on_press(Message::CloseOverlay);
-        let overlay_content = if self.note_creator_open {
-            self.note_creator()
-        } else if self.vault_manager_open {
+        .on_press(Message::CloseOverlay)
+        .on_right_press(Message::CloseOverlay);
+        let overlay_content = if self.vault_manager_open {
             self.vault_manager()
         } else {
             self.command_palette()
@@ -1545,10 +1623,6 @@ impl Notiz {
                     .on_press(Message::ToggleSidebar)
                     .padding([9, 12])
                     .style(theme::ghost_button),
-                button(text("+").size(22))
-                    .on_press(Message::CreateNote)
-                    .padding([7, 13])
-                    .style(theme::primary_button),
             ]
             .spacing(10)
             .align_x(iced::Alignment::Center);
@@ -1559,6 +1633,14 @@ impl Notiz {
                         .padding([10, 13])
                         .style(theme::ghost_button),
                 )
+                .push(tooltip(
+                    button(lucide_icon("\u{E130}").size(17).color(INDIGO))
+                        .on_press(Message::OpenHome)
+                        .padding([10, 13])
+                        .style(theme::ghost_button),
+                    text("Início").size(12),
+                    tooltip::Position::Right,
+                ))
                 .push(
                     button(lucide_icon("\u{E125}").size(17).color(MUTED))
                         .on_press(Message::OpenGraph)
@@ -1568,7 +1650,7 @@ impl Notiz {
             return container(rail.padding([14, 8]))
                 .width(self.sidebar_width)
                 .height(Fill)
-                .style(|_| theme::panel(SIDEBAR, BORDER, 0.0))
+                .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
                 .into();
         }
 
@@ -1581,10 +1663,6 @@ impl Notiz {
             ]
             .spacing(2)
             .width(Fill),
-            button(text("+").size(23))
-                .on_press(Message::CreateNote)
-                .padding([5, 11])
-                .style(theme::primary_button),
             button(lucide_icon("\u{E21C}").size(20).color(MUTED))
                 .on_press(Message::ToggleSidebar)
                 .padding([7, 10])
@@ -1628,14 +1706,60 @@ impl Notiz {
         ]
         .spacing(7);
 
+        let shortcuts = column![
+            button(
+                row![
+                    text("Início").size(13),
+                    Space::new().width(Fill),
+                    text("⌂").size(16)
+                ]
+                .align_y(iced::Alignment::Center)
+            )
+            .on_press(Message::OpenHome)
+            .padding([9, 12])
+            .width(Fill)
+            .style(|_, status| theme::note_button(self.active_tab.is_none(), status)),
+            button(
+                row![
+                    text("Diário de hoje").size(13),
+                    Space::new().width(Fill),
+                    text("⇧ D").size(10).color(DIM)
+                ]
+                .align_y(iced::Alignment::Center)
+            )
+            .on_press_maybe(
+                (!self.busy).then_some(Message::CreateFromTemplate(NoteTemplate::Daily))
+            )
+            .padding([9, 12])
+            .width(Fill)
+            .style(theme::ghost_button),
+            row![
+                button(text("+ Sessão").size(12))
+                    .on_press_maybe(
+                        (!self.busy).then_some(Message::CreateFromTemplate(NoteTemplate::Session))
+                    )
+                    .width(Fill)
+                    .padding([9, 10])
+                    .style(theme::ghost_button),
+                button(text("+ Memória").size(12))
+                    .on_press_maybe(
+                        (!self.busy).then_some(Message::CreateFromTemplate(NoteTemplate::Memory))
+                    )
+                    .width(Fill)
+                    .padding([9, 10])
+                    .style(theme::ghost_button),
+            ]
+            .spacing(4),
+        ]
+        .spacing(3);
         container(
-            column![header, self.tree_panel(), footer]
+            column![header, shortcuts, self.tree_panel(), footer]
                 .spacing(12)
-                .padding(14),
+                .padding(12),
         )
         .width(self.sidebar_width)
         .height(Fill)
-        .style(|_| theme::panel(SIDEBAR, BORDER, 0.0))
+        .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
         .into()
     }
 
@@ -1647,72 +1771,74 @@ impl Notiz {
             .size(14)
             .style(theme::input);
 
-        let controls = row![
+        let search_controls = row![
             search,
             button(lucide_icon("\u{E0D7}").size(16).color(MUTED))
-                .on_press(Message::ToggleFolderCreator)
-                .padding([9, 10])
+                .on_press(Message::OpenFolderCreator(self.selected_folder.clone()))
+                .width(36)
+                .height(36)
+                .padding(0)
                 .style(theme::ghost_button),
-            button(lucide_icon("\u{E151}").size(17).color(MUTED))
+            button(lucide_icon("\u{E151}").size(16).color(MUTED))
                 .on_press(Message::TogglePalette)
-                .padding([9, 10])
+                .width(36)
+                .height(36)
+                .padding(0)
                 .style(theme::ghost_button),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
 
-        let controls = if self.selected_notes.is_empty() && self.selected_folders.is_empty() {
-            controls
-        } else {
-            controls.push(
-                button(lucide_icon("\u{E18E}").size(17).color(TEXT))
+        let mut tree_header = row![
+            text("NOTES").size(10).color(DIM),
+            Space::new().width(Fill),
+            button(text(self.tree_sort.label()).size(10).color(MUTED))
+                .on_press(Message::CycleTreeSort)
+                .height(28)
+                .padding([0, 8])
+                .style(theme::ghost_button),
+        ]
+        .align_y(iced::Alignment::Center);
+        if !self.selected_notes.is_empty() || !self.selected_folders.is_empty() {
+            tree_header = tree_header.push(
+                button(lucide_icon("\u{E18E}").size(15).color(DANGER))
                     .on_press(Message::DeleteSelection)
-                    .padding([9, 10])
+                    .width(28)
+                    .height(28)
+                    .padding(0)
                     .style(theme::danger_button),
-            )
-        };
-
-        let folder_creator: Element<'_, Message> = if self.folder_creator_open {
-            row![
-                text_input("New subfolder…", &self.folder_name)
-                    .id(folder_input_id())
-                    .on_input(Message::FolderNameChanged)
-                    .on_submit(Message::CreateFolderRequested)
-                    .padding([8, 10])
-                    .size(12)
-                    .style(theme::input),
-                button(text("Create").size(11))
-                    .on_press(Message::CreateFolderRequested)
-                    .padding([9, 10])
-                    .style(theme::primary_button),
-            ]
-            .spacing(6)
-            .into()
-        } else {
-            Space::new().height(0).into()
-        };
-
-        let mut list = column![].spacing(5).width(Fill);
-        for note in self
-            .visible_notes
-            .iter()
-            .filter(|note| note_folder(&note.relative_path).is_empty())
-        {
-            list = list.push(self.note_card(note, 0));
+            );
         }
 
-        for folder in &self.folders {
+        let ordered_notes = self.ordered_visible_notes();
+        let ordered_folders = self.ordered_folders();
+        let mut list = column![].spacing(2).width(Fill);
+        if self.folder_creator_open && self.selected_folder.is_empty() {
+            list = list.push(self.tree_creator_input(0, true));
+        }
+        if self.note_creator_open && self.note_creator_folder.is_empty() {
+            list = list.push(self.tree_creator_input(0, false));
+        }
+        for note in ordered_notes
+            .iter()
+            .copied()
+            .filter(|note| note_folder(&note.relative_path).is_empty())
+        {
+            list = list.push(self.note_card(note, 10.0));
+        }
+
+        for folder in &ordered_folders {
             if !self.folder_row_visible(folder) {
                 continue;
             }
             let selected = self.selected_folder == *folder;
             let expanded = !self.collapsed_folders.contains(folder);
-            let depth = folder.split('/').count();
+            let depth = folder.split('/').count().saturating_sub(1);
             let label = Path::new(folder)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or(folder);
-            let ids = self.notes_in_folder(folder);
+                .unwrap_or(folder)
+                .to_owned();
             let checked = self.selected_folders.contains(folder);
             let hovered = self.hovered_folder.as_deref() == Some(folder.as_str());
             let selector_hovered = self.hovered_folder_selector.as_deref() == Some(folder.as_str());
@@ -1721,18 +1847,25 @@ impl Notiz {
                 .as_ref()
                 .is_some_and(|drag| drag.active && drag.item == TreeItem::Folder(folder.clone()));
             let drop_target = self.tree_drop_target == Some(TreeItem::Folder(folder.clone()));
-            let folder_checkbox: Element<'_, Message> = if selector_hovered || checked {
+            let folder_indicator: Element<'_, Message> = if selector_hovered || checked {
                 let folder = folder.clone();
                 checkbox(checked)
                     .on_toggle(move |_| Message::ToggleFolderSelection(folder.clone()))
                     .size(16)
                     .into()
             } else {
-                Space::new().width(16).into()
+                container(
+                    lucide_icon(if expanded { "\u{E247}" } else { "\u{E0D7}" })
+                        .size(14)
+                        .color(if expanded { INDIGO_LIGHT } else { MUTED }),
+                )
+                .width(16)
+                .align_x(iced::alignment::Horizontal::Center)
+                .into()
             };
             let folder = folder.clone();
             let folder_selector = mouse_area(
-                container(folder_checkbox)
+                container(folder_indicator)
                     .width(22)
                     .align_x(iced::alignment::Horizontal::Center),
             )
@@ -1740,12 +1873,10 @@ impl Notiz {
             .on_exit(Message::HoverFolderSelector(None));
             let folder_body = mouse_area(
                 row![
-                    lucide_icon("\u{E0D7}").size(14).color(MUTED),
                     text(label)
-                        .size(14)
+                        .size(13)
                         .color(if selected { TEXT } else { MUTED }),
                     Space::new().width(Fill),
-                    text(ids.len()).size(11).color(DIM),
                 ]
                 .spacing(7)
                 .align_y(iced::Alignment::Center)
@@ -1753,21 +1884,52 @@ impl Notiz {
             )
             .on_enter(Message::HoverFolderNest(Some(folder.clone())))
             .on_exit(Message::HoverFolderNest(None));
+            let folder_leading = row![
+                container(
+                    text(if expanded { "⌄" } else { "›" })
+                        .size(15)
+                        .color(if expanded { INDIGO_LIGHT } else { MUTED }),
+                )
+                .width(18)
+                .align_x(iced::alignment::Horizontal::Center),
+                folder_selector,
+            ]
+            .width(TREE_LEADING_WIDTH)
+            .spacing(0)
+            .align_y(iced::Alignment::Center);
+            let add_note: Element<'_, Message> = container(if hovered {
+                button(text("+").size(16).color(MUTED))
+                    .on_press(Message::CreateNoteIn(folder.clone()))
+                    .width(TREE_ACTION_WIDTH)
+                    .height(26)
+                    .padding(0)
+                    .style(theme::ghost_button)
+            } else {
+                button(text("").size(16))
+                    .width(TREE_ACTION_WIDTH)
+                    .height(26)
+                    .padding(0)
+                    .style(theme::transparent_button)
+            })
+            .width(TREE_ACTION_WIDTH)
+            .height(26)
+            .into();
             let folder_row = container(
                 row![
-                    text("  ".repeat(depth.saturating_sub(1))).size(10),
-                    text(if expanded { "⌄" } else { "›" }).size(15).color(MUTED),
-                    folder_selector,
+                    Space::new().width(depth as f32 * TREE_INDENT),
+                    folder_leading,
                     folder_body,
+                    add_note,
                 ]
-                .spacing(7)
+                .spacing(4)
                 .align_y(iced::Alignment::Center),
             )
             .width(Fill)
-            .padding([9, 9])
+            .padding([6, TREE_ROW_PADDING_X])
             .style(move |_| {
-                theme::note_surface(
+                theme::folder_surface(
                     selected,
+                    expanded,
                     hovered,
                     dragging || drop_target,
                     self.tree_drag_progress,
@@ -1781,26 +1943,36 @@ impl Notiz {
                         folder.clone(),
                     )))
                     .on_release(Message::EndTreeInteraction)
+                    .on_right_press(Message::OpenTreeContext(TreeContextTarget::Folder(
+                        folder.clone(),
+                    )))
                     .interaction(if dragging {
                         mouse::Interaction::Grabbing
                     } else {
                         mouse::Interaction::Pointer
                     }),
             );
+            if self.folder_creator_open && self.selected_folder == *folder {
+                list = list.push(self.tree_creator_input(depth, true));
+            }
+            if self.note_creator_open && self.note_creator_folder == *folder {
+                list = list.push(self.tree_creator_input(depth, false));
+            }
             if expanded {
-                for note in self
-                    .visible_notes
+                for note in ordered_notes
                     .iter()
+                    .copied()
                     .filter(|note| note_folder(&note.relative_path) == *folder)
                 {
-                    list = list.push(self.note_card(note, depth + 1));
+                    let note_indent = depth as f32 * TREE_INDENT + 10.0;
+                    list = list.push(self.note_card(note, note_indent));
                 }
             }
         }
 
         let drag_hint: Element<'_, Message> = if self.tree_drag.is_some() {
             container(
-                text("Drop on a folder name to nest · use the leading edge to reorder")
+                text("Drop on a folder to move · drag left to move out")
                     .size(10)
                     .color(INDIGO_LIGHT),
             )
@@ -1812,24 +1984,25 @@ impl Notiz {
         };
 
         column![
-            controls,
-            folder_creator,
-            scrollable(list).height(Fill),
-            drag_hint
+            search_controls,
+            tree_header,
+            mouse_area(scrollable(list).height(Fill))
+                .on_right_press(Message::OpenTreeContext(TreeContextTarget::Root)),
+            drag_hint,
         ]
-        .spacing(10)
+        .spacing(8)
         .height(Fill)
         .into()
     }
 
-    fn note_card<'a>(&'a self, note: &'a NoteSummary, depth: usize) -> Element<'a, Message> {
+    fn note_card<'a>(&'a self, note: &'a NoteSummary, indent: f32) -> Element<'a, Message> {
         let active = self
             .active_tab
             .is_some_and(|tab| tab == WorkspaceTab::Note(note.id));
         let excerpt = if note.excerpt.is_empty() {
             note.relative_path.clone()
         } else {
-            shorten(&note.excerpt, 82)
+            shorten(&note.excerpt, 56)
         };
         let selected = self.selected_notes.contains(&note.id);
         let hovered = self.hovered_note == Some(note.id);
@@ -1858,26 +2031,30 @@ impl Notiz {
         .on_exit(Message::HoverNoteSelector(None));
         let card = container(
             row![
-                text("  ".repeat(depth)).size(10),
+                Space::new().width(indent),
                 selector,
-                Space::new().width(4),
                 column![
                     text(&note.title)
-                        .size(14)
+                        .size(13)
                         .color(if active { TEXT } else { MUTED }),
-                    text(excerpt).size(11).color(DIM),
+                    text(excerpt)
+                        .size(10)
+                        .color(DIM)
+                        .width(Fill)
+                        .wrapping(iced::widget::text::Wrapping::None),
                 ]
-                .spacing(3)
+                .spacing(1)
                 .width(Fill),
             ]
-            .spacing(7)
+            .spacing(6)
             .align_y(iced::Alignment::Center),
         )
         .width(Fill)
-        .padding([10, 10])
+        .padding([7, TREE_ROW_PADDING_X])
         .style(move |_| {
             theme::note_surface(
                 active,
+                indent > TREE_LEADING_WIDTH,
                 hovered,
                 dragging || drop_target,
                 self.tree_drag_progress,
@@ -1888,6 +2065,7 @@ impl Notiz {
             .on_exit(Message::HoverNote(None))
             .on_press(Message::BeginTreeInteraction(TreeItem::Note(note.id)))
             .on_release(Message::EndTreeInteraction)
+            .on_right_press(Message::OpenTreeContext(TreeContextTarget::Note(note.id)))
             .interaction(if dragging {
                 mouse::Interaction::Grabbing
             } else {
@@ -1912,7 +2090,7 @@ impl Notiz {
             )
             .width(self.inspector_width)
             .height(Fill)
-            .style(|_| theme::panel(SIDEBAR, BORDER, 0.0))
+            .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
             .into();
         }
 
@@ -1992,7 +2170,7 @@ impl Notiz {
                             .width(Fill)
                             .style(|_| {
                                 theme::panel(
-                                    Color::from_rgba(0.40, 0.35, 0.95, 0.10),
+                                    Color::from_rgba(1.0, 0.78, 0.60, 0.10),
                                     Color::TRANSPARENT,
                                     7.0,
                                 )
@@ -2012,9 +2190,6 @@ impl Notiz {
             .spacing(7)
             .align_y(iced::Alignment::Center),
             backlinks,
-            container(Space::new().height(1))
-                .width(Fill)
-                .style(|_| { theme::panel(BORDER, Color::TRANSPARENT, 0.0) }),
             row![
                 lucide_icon("\u{E102}").size(14).color(MUTED),
                 text(format!("OUTGOING LINKS · {}", outgoing_edges.len()))
@@ -2024,9 +2199,6 @@ impl Notiz {
             .spacing(7)
             .align_y(iced::Alignment::Center),
             outgoing,
-            container(Space::new().height(1))
-                .width(Fill)
-                .style(|_| { theme::panel(BORDER, Color::TRANSPARENT, 0.0) }),
             row![
                 lucide_icon("\u{E35C}").size(14).color(MUTED),
                 text("TAGS").size(11).color(MUTED),
@@ -2042,8 +2214,8 @@ impl Notiz {
             column![
                 row![
                     column![
-                        text("CONTEXTO").size(13).color(TEXT),
-                        text(format!("{} referências", self.backlinks.len()))
+                        text("CONTEXT").size(13).color(TEXT),
+                        text(format!("{} references", self.backlinks.len()))
                             .size(11)
                             .color(DIM),
                     ]
@@ -2062,23 +2234,131 @@ impl Notiz {
         )
         .width(self.inspector_width)
         .height(Fill)
-        .style(|_| theme::panel(SIDEBAR, BORDER, 0.0))
+        .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
+        .into()
+    }
+
+    fn home_workspace(&self) -> Element<'_, Message> {
+        let mut recent = column![text("RETOMAR DE ONDE PAROU").size(11).color(DIM)].spacing(8);
+        let mut notes = self.notes.iter().collect::<Vec<_>>();
+        notes.sort_by_key(|note| std::cmp::Reverse(note.updated_at));
+        for note in notes.into_iter().take(7) {
+            recent = recent.push(
+                button(
+                    row![
+                        lucide_icon("\u{E130}").size(16).color(INDIGO),
+                        column![
+                            text(&note.title).size(14).color(TEXT),
+                            text(&note.relative_path).size(11).color(DIM),
+                        ]
+                        .spacing(3)
+                        .width(Fill),
+                        text(note.updated_at.format("%d/%m").to_string())
+                            .size(11)
+                            .color(DIM),
+                    ]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center),
+                )
+                .on_press(Message::OpenNote(note.id))
+                .width(Fill)
+                .padding([12, 14])
+                .style(theme::ghost_button),
+            );
+        }
+        if self.notes.is_empty() {
+            recent = recent.push(
+                text("Suas notas recentes aparecerão aqui.")
+                    .size(13)
+                    .color(MUTED),
+            );
+        }
+        let content = column![
+            text("SEU ESPAÇO PESSOAL").size(11).color(INDIGO),
+            text("Menos dispersão. Mais contexto.").size(32).color(TEXT),
+            text("Reúna seu dia, suas sessões e o que vale lembrar.\nTudo em Markdown, no seu computador.")
+                .size(15).color(MUTED),
+            Space::new().height(16),
+            self.template_button(NoteTemplate::Daily, "Diário de hoje", "Prioridades, registro e próximos passos", "\u{E130}"),
+            self.template_button(NoteTemplate::Session, "Nova sessão", "Contexto, decisões e continuidade", "\u{E05F}"),
+            self.template_button(NoteTemplate::Memory, "Nova memória", "Aprendizados e referências duráveis", "\u{E125}"),
+            button(text("+ Nota livre").size(13))
+                .on_press(Message::CreateNote)
+                .padding([10, 14])
+                .style(theme::ghost_button),
+            Space::new().height(18),
+            recent,
+            Space::new().height(12),
+            text("Conecte ideias com [[links]]  ·  Ctrl+K para comandos  ·  Ctrl+Shift+D para hoje")
+                .size(11).color(DIM),
+            self.status_bar(),
+        ]
+        .spacing(10)
+        .max_width(780)
+        .padding([28, 32]);
+        scrollable(
+            container(content)
+                .width(Fill)
+                .align_x(iced::Alignment::Center),
+        )
+        .height(Fill)
+        .into()
+    }
+
+    fn template_button<'a>(
+        &self,
+        template: NoteTemplate,
+        label: &'a str,
+        description: &'a str,
+        icon: &'static str,
+    ) -> Element<'a, Message> {
+        button(
+            row![
+                lucide_icon(icon).size(20).color(INDIGO),
+                column![
+                    text(label).size(15).color(TEXT),
+                    text(description).size(12).color(MUTED),
+                ]
+                .spacing(4)
+                .width(Fill),
+                text("→").size(18).color(DIM),
+            ]
+            .spacing(14)
+            .align_y(iced::Alignment::Center),
+        )
+        .on_press_maybe((!self.busy).then_some(Message::CreateFromTemplate(template)))
+        .width(Fill)
+        .padding([16, 18])
+        .style(|_, status| theme::note_button(false, status))
         .into()
     }
 
     fn main_workspace(&self) -> Element<'_, Message> {
         let content = match self.active_tab {
             Some(WorkspaceTab::Graph) => self.graph_workspace(),
-            Some(WorkspaceTab::Note(_)) | None => self.note_workspace(),
+            Some(WorkspaceTab::Note(_)) => self.note_workspace(),
+            None => self.home_workspace(),
         };
-        column![self.tab_bar(), content]
+        container(column![self.tab_bar(), content])
             .width(Fill)
             .height(Fill)
+            .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
             .into()
     }
 
     fn tab_bar(&self) -> Element<'_, Message> {
-        let mut tabs = row![].spacing(7).align_y(iced::Alignment::Center);
+        let mut tabs = row![tooltip(
+            button(lucide_icon("\u{E130}").size(16).color(INDIGO))
+                .on_press(Message::OpenHome)
+                .width(34)
+                .height(38)
+                .padding(8)
+                .style(theme::ghost_button),
+            text("Início").size(12),
+            tooltip::Position::Bottom,
+        )]
+        .spacing(7)
+        .align_y(iced::Alignment::Center);
         let mut index = 0;
         while index < self.open_tabs.len() {
             if let Some(animation) = self.tab_reorder
@@ -2145,7 +2425,7 @@ impl Notiz {
         .width(Fill)
         .height(52)
         .padding([6, 10])
-        .style(|_| theme::panel(SIDEBAR, BORDER, 0.0))
+        .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
         .into()
     }
 
@@ -2229,38 +2509,41 @@ impl Notiz {
             .iter()
             .filter(|edge| edge.target.is_none())
             .count();
-        column![
-            row![
-                column![
-                    text("Knowledge graph").size(18).color(TEXT),
-                    text(format!(
-                        "{} nodes · {} relationships · {unresolved} unresolved links",
-                        self.graph.nodes.len(),
-                        self.graph.edges.len()
-                    ))
-                    .size(10)
-                    .color(MUTED),
+        container(
+            column![
+                row![
+                    column![
+                        text("Knowledge graph").size(18).color(TEXT),
+                        text(format!(
+                            "{} nodes · {} relationships · {unresolved} unresolved links",
+                            self.graph.nodes.len(),
+                            self.graph.edges.len()
+                        ))
+                        .size(10)
+                        .color(MUTED),
+                    ]
+                    .spacing(3),
+                    Space::new().width(Fill),
+                    button(lucide_icon("\u{E145}").size(15).color(MUTED))
+                        .on_press(Message::RefreshRequested)
+                        .padding([8, 10])
+                        .style(theme::ghost_button),
                 ]
-                .spacing(3),
-                Space::new().width(Fill),
-                button(lucide_icon("\u{E145}").size(15).color(MUTED))
-                    .on_press(Message::RefreshRequested)
-                    .padding([8, 10])
-                    .style(theme::ghost_button),
+                .align_y(iced::Alignment::Center),
+                container(
+                    graph::view(&self.graph, self.active_note.as_ref().map(|note| note.id))
+                        .map(Message::Graph),
+                )
+                .width(Fill)
+                .height(Fill)
+                .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0)),
             ]
-            .align_y(iced::Alignment::Center),
-            container(
-                graph::view(&self.graph, self.active_note.as_ref().map(|note| note.id))
-                    .map(Message::Graph),
-            )
-            .width(Fill)
-            .height(Fill)
-            .style(|_| theme::panel(BACKGROUND, BORDER, 10.0)),
-        ]
-        .spacing(10)
-        .padding(14)
+            .spacing(8)
+            .padding(12),
+        )
         .width(Fill)
         .height(Fill)
+        .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
         .into()
     }
 
@@ -2290,9 +2573,9 @@ impl Notiz {
 
         let title = text_input("Title", &self.title)
             .on_input(Message::TitleChanged)
-            .padding([8, 10])
+            .padding([6, 8])
             .size(20)
-            .style(theme::input);
+            .style(theme::inline_input);
         let mode_icon = match self.mode {
             WorkspaceMode::Editor | WorkspaceMode::Split => "\u{E130}",
             WorkspaceMode::Preview => "\u{E05F}",
@@ -2316,18 +2599,10 @@ impl Notiz {
                 .on_press(Message::ToggleNoteSearch)
                 .padding([8, 10])
                 .style(theme::ghost_button),
-            button(text(if self.saving { "Saving…" } else { "Save" }).size(11))
-                .on_press(Message::SaveRequested)
-                .padding([8, 12])
-                .style(theme::primary_button),
             button(text("↻").size(17))
                 .on_press(Message::RefreshRequested)
                 .padding([5, 11])
                 .style(theme::ghost_button),
-            button(text("Delete").size(11))
-                .on_press(Message::DeleteRequested)
-                .padding([8, 11])
-                .style(theme::danger_button),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
@@ -2336,9 +2611,9 @@ impl Notiz {
             text("#").size(15).color(INDIGO_LIGHT),
             text_input("tags separated by commas", &self.tags)
                 .on_input(Message::TagsChanged)
-                .padding([7, 10])
+                .padding([5, 8])
                 .size(12)
-                .style(theme::input),
+                .style(theme::inline_input),
             text(
                 self.active_note
                     .as_ref()
@@ -2372,7 +2647,7 @@ impl Notiz {
             .width(Fill)
             .height(Fill)
             .center(Fill)
-            .style(|_| theme::panel(BACKGROUND, BORDER, 10.0))
+            .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
             .into()
         };
         let workspace_content = || -> Element<'_, Message> {
@@ -2415,7 +2690,7 @@ impl Notiz {
                     .on_submit(Message::NavigateNoteSearch(1))
                     .padding([7, 9])
                     .size(12)
-                    .style(theme::input),
+                    .style(theme::inline_input),
                 text(result).size(11).color(DIM),
                 button(text("↑").size(14))
                     .on_press(Message::NavigateNoteSearch(-1))
@@ -2437,17 +2712,20 @@ impl Notiz {
             Space::new().height(0).into()
         };
 
-        let main = column![header, tags, search_bar, workspace, self.status_bar()]
-            .spacing(10)
-            .padding(Padding {
-                top: 14.0,
-                right: 14.0,
-                bottom: 9.0,
-                left: 14.0,
-            })
-            .width(Fill)
-            .height(Fill);
-        main.into()
+        container(
+            column![header, tags, search_bar, workspace, self.status_bar()]
+                .spacing(7)
+                .padding(Padding {
+                    top: 10.0,
+                    right: 12.0,
+                    bottom: 8.0,
+                    left: 12.0,
+                }),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
+        .into()
     }
 
     fn editor_view(&self) -> Element<'_, Message> {
@@ -2465,100 +2743,128 @@ impl Notiz {
             .style(|_, _| text_editor::Style {
                 background: Background::Color(BACKGROUND),
                 border: Border {
-                    color: BORDER,
-                    width: 1.0,
-                    radius: 10.0.into(),
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 0.0.into(),
                 },
                 placeholder: DIM,
                 value: TEXT,
-                selection: Color::from_rgba(0.40, 0.35, 0.95, 0.42),
+                selection: Color::from_rgba(1.0, 0.78, 0.60, 0.42),
             });
         container(editor).width(Fill).height(Fill).into()
     }
 
     fn preview_view(&self) -> Element<'_, Message> {
-        let mut blocks = column![].spacing(4).width(Fill);
-        for block in &self.preview_blocks {
-            let content = searchable_markdown::view(
-                block.content.items(),
-                Theme::TokyoNight,
-                &self.note_search_query,
-            )
+        let document = self
+            .preview_document
+            .view(&self.note_search_query)
             .map(Message::MarkdownLinkClicked);
-            blocks = blocks.push(
-                container(content)
-                    .width(Fill)
-                    .padding([7, 10])
-                    .style(|_| theme::panel(Color::TRANSPARENT, Color::TRANSPARENT, 0.0)),
-            );
-        }
-        let preview = scrollable(container(blocks).padding(20))
+        let preview = scrollable(container(document).width(Fill).padding([22, 26]))
             .id(preview_scroll_id())
             .on_scroll(|viewport| Message::PreviewScrolled(viewport.relative_offset().y))
             .height(Fill);
         container(preview)
             .width(Fill)
             .height(Fill)
-            .style(|_| theme::panel(BACKGROUND, BORDER, 10.0))
+            .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
             .into()
     }
 
-    fn note_creator(&self) -> Element<'_, Message> {
-        let mut folders = vec!["Root".to_owned()];
-        folders.extend(self.folders.iter().cloned());
+    fn tree_context_menu(&self, target: &TreeContextTarget) -> Element<'_, Message> {
+        let folder = match target {
+            TreeContextTarget::Folder(folder) => folder.clone(),
+            TreeContextTarget::Root => String::new(),
+            TreeContextTarget::Note(id) => self
+                .notes
+                .iter()
+                .find(|note| note.id == *id)
+                .map(|note| note_folder(&note.relative_path))
+                .unwrap_or_default(),
+        };
+        let title = match target {
+            TreeContextTarget::Root => "Vault root".to_owned(),
+            TreeContextTarget::Folder(folder) => folder.clone(),
+            TreeContextTarget::Note(_) => "Note".to_owned(),
+        };
+        let delete: Element<'_, Message> = match target {
+            TreeContextTarget::Folder(folder) => button(text("Delete folder").size(12).color(TEXT))
+                .on_press(Message::DeleteTreeItem(TreeItem::Folder(folder.clone())))
+                .width(Fill)
+                .padding([8, 10])
+                .style(theme::danger_button)
+                .into(),
+            TreeContextTarget::Note(id) => button(text("Delete note").size(12).color(TEXT))
+                .on_press(Message::DeleteTreeItem(TreeItem::Note(*id)))
+                .width(Fill)
+                .padding([8, 10])
+                .style(theme::danger_button)
+                .into(),
+            TreeContextTarget::Root => Space::new().height(0).into(),
+        };
         container(
             column![
-                column![
-                    text("New note").size(19).color(TEXT),
-                    text("Choose where the Markdown file should live.")
-                        .size(12)
-                        .color(MUTED),
-                ]
-                .spacing(4),
-                column![
-                    text("TITLE").size(10).color(DIM),
-                    text_input("Untitled note", &self.note_creator_title)
-                        .id(note_creator_title_id())
-                        .on_input(Message::NoteCreatorTitleChanged)
-                        .on_submit(Message::ConfirmCreateNote)
-                        .padding([11, 12])
-                        .size(14)
-                        .style(theme::input),
-                ]
-                .spacing(6),
-                column![
-                    text("FOLDER").size(10).color(DIM),
-                    pick_list(
-                        folders,
-                        Some(self.note_creator_folder.clone()),
-                        Message::NoteCreatorFolderChanged,
-                    )
+                text("Create or manage").size(14).color(TEXT),
+                text(title).size(10).color(MUTED),
+                button(text("New note").size(12).color(TEXT))
+                    .on_press(Message::CreateNoteIn(folder.clone()))
                     .width(Fill)
-                    .padding([10, 12]),
-                ]
-                .spacing(6),
-                row![
-                    Space::new().width(Fill),
-                    button(text("Cancel").size(12))
-                        .on_press(Message::CancelNoteCreator)
-                        .padding([9, 13])
-                        .style(theme::ghost_button),
-                    button(text("Create note").size(12))
-                        .on_press_maybe(
-                            (!self.note_creator_title.trim().is_empty())
-                                .then_some(Message::ConfirmCreateNote,)
-                        )
-                        .padding([9, 14])
-                        .style(theme::primary_button),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
+                    .padding([8, 10])
+                    .style(theme::ghost_button),
+                button(text("New folder").size(12).color(TEXT))
+                    .on_press(Message::OpenFolderCreator(folder))
+                    .width(Fill)
+                    .padding([8, 10])
+                    .style(theme::ghost_button),
+                delete,
             ]
-            .spacing(17)
-            .padding(18),
+            .spacing(6)
+            .padding(10),
         )
-        .width(460)
-        .style(|_| theme::panel(SIDEBAR, BORDER, 12.0))
+        .width(190)
+        .style(|_| theme::panel(SIDEBAR, BORDER, 9.0))
+        .into()
+    }
+
+    fn tree_creator_input(&self, depth: usize, is_folder: bool) -> Element<'_, Message> {
+        let value = if is_folder {
+            &self.folder_name
+        } else {
+            &self.note_creator_title
+        };
+        let message = if is_folder {
+            Message::FolderNameChanged
+        } else {
+            Message::NoteCreatorTitleChanged
+        };
+        let submit = if is_folder {
+            Message::CreateFolderRequested
+        } else {
+            Message::ConfirmCreateNote
+        };
+        let placeholder = if is_folder {
+            "New folder…"
+        } else {
+            "New note…"
+        };
+        container(
+            row![
+                Space::new().width(depth as f32 * TREE_INDENT + TREE_LEADING_WIDTH + 4.0),
+                text_input(placeholder, value)
+                    .id(if is_folder {
+                        folder_input_id()
+                    } else {
+                        note_creator_title_id()
+                    })
+                    .on_input(message)
+                    .on_submit(submit)
+                    .padding([7, 9])
+                    .size(12)
+                    .style(theme::inline_input),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([4, TREE_ROW_PADDING_X])
+        .width(Fill)
         .into()
     }
 
@@ -2672,6 +2978,21 @@ impl Notiz {
     fn palette_entries(&self) -> Vec<PaletteEntry> {
         let commands = [
             ("Create new note", "Ctrl+N", PaletteAction::CreateNote),
+            (
+                "Abrir diário de hoje",
+                "Ctrl+Shift+D",
+                PaletteAction::CreateFromTemplate(NoteTemplate::Daily),
+            ),
+            (
+                "Nova sessão",
+                "Sessions",
+                PaletteAction::CreateFromTemplate(NoteTemplate::Session),
+            ),
+            (
+                "Nova memória",
+                "Memory",
+                PaletteAction::CreateFromTemplate(NoteTemplate::Memory),
+            ),
             ("Open note tree", "Sidebar", PaletteAction::OpenTree),
             ("Open graph", "New tab", PaletteAction::OpenGraph),
             (
@@ -2791,6 +3112,7 @@ impl Notiz {
         self.tree_drag = None;
         self.tree_drop_target = None;
         self.tree_nest_target = None;
+        self.context_menu = None;
         self.collapsed_folders.clear();
         self.tab_hold = None;
         self.tab_drag = None;
@@ -2799,21 +3121,6 @@ impl Notiz {
         self.workspace_mounting = false;
         self.clear_active_note();
         self.apply_snapshot(snapshot);
-    }
-
-    fn notes_in_folder(&self, folder: &str) -> Vec<Uuid> {
-        self.notes
-            .iter()
-            .filter(|note| {
-                let note_folder = note_folder(&note.relative_path);
-                folder.is_empty()
-                    || note_folder == folder
-                    || note_folder
-                        .strip_prefix(folder)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            })
-            .map(|note| note.id)
-            .collect()
     }
 
     fn folder_row_visible(&self, folder: &str) -> bool {
@@ -2825,6 +3132,67 @@ impl Notiz {
             parent = folder_parent(&parent);
         }
         true
+    }
+
+    fn ordered_visible_notes(&self) -> Vec<&NoteSummary> {
+        self.ordered_note_refs(&self.visible_notes)
+    }
+
+    fn ordered_note_refs<'a>(&self, notes: &'a [NoteSummary]) -> Vec<&'a NoteSummary> {
+        let mut ordered = notes.iter().collect::<Vec<_>>();
+        match self.tree_sort {
+            TreeSort::Alphabetical => ordered.sort_by(|left, right| {
+                left.title
+                    .to_lowercase()
+                    .cmp(&right.title.to_lowercase())
+                    .then_with(|| left.relative_path.cmp(&right.relative_path))
+            }),
+            TreeSort::Updated => ordered.sort_by(|left, right| {
+                right
+                    .updated_at
+                    .cmp(&left.updated_at)
+                    .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+            }),
+        }
+        ordered
+    }
+
+    fn ordered_folders(&self) -> Vec<String> {
+        fn visit(
+            parent: &str,
+            folders: &[String],
+            notes: &[NoteSummary],
+            sort: TreeSort,
+            ordered: &mut Vec<String>,
+        ) {
+            let mut children = folders
+                .iter()
+                .filter(|folder| folder_parent(folder) == parent)
+                .collect::<Vec<_>>();
+            children.sort_by(|left, right| match sort {
+                TreeSort::Updated => {
+                    let updated = |folder: &str| {
+                        notes
+                            .iter()
+                            .filter(|note| path_is_in_folder(&note.relative_path, folder))
+                            .map(|note| note.updated_at)
+                            .max()
+                    };
+                    updated(right)
+                        .cmp(&updated(left))
+                        .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
+                }
+                TreeSort::Alphabetical => left.to_lowercase().cmp(&right.to_lowercase()),
+            });
+            for child in children {
+                ordered.push(child.clone());
+                visit(child, folders, notes, sort, ordered);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(self.folders.len());
+        visit("", &self.folders, &self.notes, self.tree_sort, &mut ordered);
+        ordered
     }
 
     fn finish_tree_interaction(&mut self) -> Task<Message> {
@@ -2861,11 +3229,7 @@ impl Notiz {
                         .unwrap_or_else(|| source_folder.clone())
                 };
                 if destination == source_folder {
-                    return if self.tree_reordered {
-                        self.persist_tree_order_task()
-                    } else {
-                        Task::none()
-                    };
+                    return Task::none();
                 }
                 let pending = self
                     .active_note
@@ -2905,40 +3269,34 @@ impl Notiz {
                     return Task::none();
                 }
                 let source_parent = folder_parent(&source);
-                let destination_parent = if horizontal < -26.0 {
+                let valid_nest_target = nest_target.filter(|folder| {
+                    !folder.is_empty()
+                        && folder != &source
+                        && !folder.starts_with(&format!("{source}/"))
+                });
+                let destination_parent = if let Some(folder) = valid_nest_target {
+                    if horizontal < -26.0 {
+                        folder_parent(&source_parent)
+                    } else {
+                        folder
+                    }
+                } else if horizontal < -26.0 {
                     folder_parent(&source_parent)
                 } else {
                     match target.as_ref() {
                         Some(TreeItem::Folder(folder))
                             if !folder.is_empty()
                                 && folder != &source
-                                && !folder.starts_with(&format!("{source}/")) =>
+                                && !folder.starts_with(&format!("{source}/"))
+                                && horizontal > 18.0 =>
                         {
-                            if folder_parent(folder) == source_parent
-                                && horizontal <= 18.0
-                                && nest_target.as_deref() != Some(folder)
-                            {
-                                source_parent.clone()
-                            } else {
-                                folder.clone()
-                            }
+                            folder.clone()
                         }
-                        Some(TreeItem::Folder(_)) => String::new(),
-                        Some(TreeItem::Note(id)) => self
-                            .notes
-                            .iter()
-                            .find(|note| note.id == *id)
-                            .map(|note| note_folder(&note.relative_path))
-                            .unwrap_or_else(|| source_parent.clone()),
-                        None => source_parent.clone(),
+                        _ => source_parent.clone(),
                     }
                 };
                 if destination_parent == source_parent {
-                    return if self.tree_reordered {
-                        self.persist_tree_order_task()
-                    } else {
-                        Task::none()
-                    };
+                    return Task::none();
                 }
                 let services = self.services.clone();
                 let sent_source = source.clone();
@@ -2979,125 +3337,11 @@ impl Notiz {
         }
     }
 
-    fn reorder_tree_drag(&mut self, cursor_y: f32) {
-        let Some(drag) = self.tree_drag.clone() else {
-            return;
-        };
-        if (self.cursor_x - drag.origin_x).abs() > 26.0 {
-            return;
-        }
-        if matches!(drag.item, TreeItem::Folder(_)) && self.tree_nest_target.is_some() {
-            return;
-        }
-        let delta = cursor_y - drag.last_y;
-        let forward = delta.is_sign_positive();
-        let Some(target) = self.adjacent_tree_item(&drag.item, forward) else {
-            return;
-        };
-        let travel = tree_item_travel(&target);
-        if delta.abs() < travel * TREE_REORDER_THRESHOLD {
-            return;
-        }
-        let reordered = match (&drag.item, &target) {
-            (TreeItem::Note(source), TreeItem::Note(target)) if source != target => {
-                let source_folder = self
-                    .notes
-                    .iter()
-                    .find(|note| note.id == *source)
-                    .map(|note| note_folder(&note.relative_path));
-                let target_folder = self
-                    .notes
-                    .iter()
-                    .find(|note| note.id == *target)
-                    .map(|note| note_folder(&note.relative_path));
-                if source_folder == target_folder {
-                    let source = self.notes.iter().position(|note| note.id == *source);
-                    let target = self.notes.iter().position(|note| note.id == *target);
-                    if let (Some(source), Some(target)) = (source, target) {
-                        self.notes.swap(source, target);
-                        if self.search.trim().is_empty() {
-                            self.visible_notes = self.notes.clone();
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            (TreeItem::Folder(source), TreeItem::Folder(target))
-                if source != target && folder_parent(source) == folder_parent(target) =>
-            {
-                reorder_adjacent_folder_blocks(&mut self.folders, source, target, forward)
-            }
-            _ => false,
-        };
-        if reordered {
-            self.tree_reordered = true;
-            if let Some(drag) = self.tree_drag.as_mut() {
-                drag.last_y += if forward { travel } else { -travel };
-            }
-        }
-    }
-
-    fn adjacent_tree_item(&self, dragged: &TreeItem, forward: bool) -> Option<TreeItem> {
-        let adjacent = |index: usize, length: usize| {
-            if forward {
-                (index + 1 < length).then_some(index + 1)
-            } else {
-                index.checked_sub(1)
-            }
-        };
-        match dragged {
-            TreeItem::Note(id) => {
-                let folder = self
-                    .notes
-                    .iter()
-                    .find(|note| note.id == *id)
-                    .map(|note| note_folder(&note.relative_path))?;
-                let siblings = self
-                    .notes
-                    .iter()
-                    .filter(|note| note_folder(&note.relative_path) == folder)
-                    .map(|note| note.id)
-                    .collect::<Vec<_>>();
-                let index = siblings.iter().position(|candidate| candidate == id)?;
-                Some(TreeItem::Note(siblings[adjacent(index, siblings.len())?]))
-            }
-            TreeItem::Folder(folder) if !folder.is_empty() => {
-                let parent = folder_parent(folder);
-                let siblings = self
-                    .folders
-                    .iter()
-                    .filter(|candidate| folder_parent(candidate) == parent)
-                    .collect::<Vec<_>>();
-                let index = siblings
-                    .iter()
-                    .position(|candidate| candidate.as_str() == folder)?;
-                Some(TreeItem::Folder(
-                    siblings[adjacent(index, siblings.len())?].to_string(),
-                ))
-            }
-            TreeItem::Folder(_) => None,
-        }
-    }
-
-    fn persist_tree_order_task(&mut self) -> Task<Message> {
-        self.tree_reordered = false;
-        let folders = self.folders.clone();
-        let notes = self.notes.iter().map(|note| note.id).collect::<Vec<_>>();
-        service_task(
-            self.services.clone(),
-            move |services| services.save_tree_order(&folders, &notes),
-            Message::TreeOrderSaved,
-        )
-    }
-
     fn clear_active_note(&mut self) {
         self.active_note = None;
         self.editor = text_editor::Content::new();
         self.preview_blocks = build_preview_blocks("");
+        self.preview_document = selectable_preview::Document::parse("*Empty note.*");
         self.title.clear();
         self.tags.clear();
         self.backlinks.clear();
@@ -3113,11 +3357,22 @@ impl Notiz {
         self.preview_job_revision = revision;
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || build_preview_sources(&body))
-                    .await
-                    .unwrap_or_else(|_| build_preview_sources(""))
+                tokio::task::spawn_blocking(move || {
+                    let rendered = renderable_markdown(&body);
+                    (
+                        build_preview_sources(&body),
+                        selectable_preview::Document::parse(&rendered),
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    (
+                        build_preview_sources(""),
+                        selectable_preview::Document::parse("*Empty note.*"),
+                    )
+                })
             },
-            move |sources| Message::PreviewPrepared(revision, sources),
+            move |(sources, document)| Message::PreviewPrepared(revision, sources, document),
         )
     }
 
@@ -3226,8 +3481,8 @@ impl Notiz {
         self.preview_blocks = vec![PreviewBlock {
             start_line: 0,
             end_line: 0,
-            content: markdown::Content::parse("*Rendering preview…*"),
         }];
+        self.preview_document = selectable_preview::Document::parse("*Rendering preview…*");
         self.backlinks = context.backlinks;
         self.active_note = Some(context.note);
         self.dirty = false;
@@ -3235,8 +3490,6 @@ impl Notiz {
         self.last_edit = std::time::Instant::now().checked_sub(PREVIEW_DELAY);
         self.preview_dirty = true;
         self.preview_building = false;
-        self.preview_queue.clear();
-        self.preview_staging.clear();
         self.note_search_query.clear();
         self.note_search_matches.clear();
         self.selected_line = 0;
@@ -3255,6 +3508,15 @@ impl Notiz {
             self.last_edit = Some(std::time::Instant::now());
             self.status = "Unsaved changes".into();
         }
+    }
+
+    /// Keep the editor mounted until all edits are safely persisted; failed saves cancel navigation.
+    fn save_before(&mut self, action: Message) -> Option<Task<Message>> {
+        if !self.dirty && !self.saving {
+            return None;
+        }
+        self.deferred_action = Some(Box::new(action));
+        Some(self.save_task())
     }
 
     fn save_task(&mut self) -> Task<Message> {
@@ -3311,7 +3573,6 @@ impl Notiz {
             || (self.tree_drag_progress - if self.tree_drag.is_some() { 1.0 } else { 0.0 }).abs()
                 > 0.002
             || self.tab_reorder.is_some()
-            || !self.preview_queue.is_empty()
         {
             time::every(Duration::from_millis(16)).map(|_| Message::AnimationTick)
         } else {
@@ -3326,7 +3587,17 @@ impl Notiz {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        Theme::custom(
+            "Vesper",
+            Palette {
+                background: BACKGROUND,
+                text: TEXT,
+                primary: INDIGO,
+                success: SUCCESS,
+                warning: INDIGO,
+                danger: DANGER,
+            },
+        )
     }
 }
 
@@ -3394,13 +3665,6 @@ fn folder_parent(folder: &str) -> String {
         .replace('\\', "/")
 }
 
-fn tree_item_travel(item: &TreeItem) -> f32 {
-    match item {
-        TreeItem::Folder(_) => TREE_FOLDER_TRAVEL,
-        TreeItem::Note(_) => TREE_NOTE_TRAVEL,
-    }
-}
-
 fn shorten(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let shortened = chars.by_ref().take(max_chars).collect::<String>();
@@ -3408,45 +3672,6 @@ fn shorten(value: &str, max_chars: usize) -> String {
         format!("{shortened}…")
     } else {
         shortened
-    }
-}
-
-fn reorder_folder_blocks(folders: &mut Vec<String>, source: &str, target: &str) -> bool {
-    let belongs_to_source = |folder: &str| {
-        folder == source
-            || folder
-                .strip_prefix(source)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    };
-    let source_block = folders
-        .iter()
-        .filter(|folder| belongs_to_source(folder))
-        .cloned()
-        .collect::<Vec<_>>();
-    if source_block.is_empty() || source_block.iter().any(|folder| folder == target) {
-        return false;
-    }
-    folders.retain(|folder| !belongs_to_source(folder));
-    let target_index = folders
-        .iter()
-        .position(|folder| folder == target)
-        .unwrap_or(folders.len());
-    for (offset, folder) in source_block.into_iter().enumerate() {
-        folders.insert(target_index + offset, folder);
-    }
-    true
-}
-
-fn reorder_adjacent_folder_blocks(
-    folders: &mut Vec<String>,
-    source: &str,
-    target: &str,
-    forward: bool,
-) -> bool {
-    if forward {
-        reorder_folder_blocks(folders, target, source)
-    } else {
-        reorder_folder_blocks(folders, source, target)
     }
 }
 
@@ -3459,7 +3684,7 @@ fn search_highlight_format(
     _theme: &Theme,
 ) -> iced::advanced::text::highlighter::Format<Font> {
     iced::advanced::text::highlighter::Format {
-        color: Some(Color::from_rgb(0.98, 0.76, 0.30)),
+        color: Some(INDIGO),
         font: None,
     }
 }
@@ -3519,7 +3744,6 @@ fn preview_block_from_source(source: PreviewSource) -> PreviewBlock {
     PreviewBlock {
         start_line: source.start_line,
         end_line: source.end_line,
-        content: markdown::Content::parse(&source.markdown),
     }
 }
 
@@ -3605,9 +3829,12 @@ fn internal_link_target(uri: &str) -> Option<String> {
 fn window_events(
     event: iced::Event,
     status: iced::event::Status,
-    _window: iced::window::Id,
+    window: iced::window::Id,
 ) -> Option<Message> {
     match event {
+        iced::Event::Window(iced::window::Event::CloseRequested) => {
+            Some(Message::CloseWindow(window))
+        }
         iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
             Some(Message::SidebarCursorMoved(position.x, position.y))
         }
@@ -3622,6 +3849,9 @@ fn window_events(
         }) => {
             use iced::keyboard::{Key, key::Named};
             match key.as_ref() {
+                Key::Character("d" | "D") if modifiers.control() && modifiers.shift() => {
+                    Some(Message::CreateFromTemplate(NoteTemplate::Daily))
+                }
                 Key::Character("k") if modifiers.control() => Some(Message::TogglePalette),
                 Key::Character("p") if modifiers.control() => Some(Message::TogglePalette),
                 Key::Character("n")
@@ -3635,7 +3865,7 @@ fn window_events(
                     Some(Message::SaveRequested)
                 }
                 Key::Character("f") if modifiers.control() => Some(Message::ToggleNoteSearch),
-                Key::Named(Named::Escape) => Some(Message::CloseOverlay),
+                Key::Named(Named::Escape) => Some(Message::CancelCreators),
                 Key::Named(Named::ArrowUp) => Some(Message::PaletteMove(-1)),
                 Key::Named(Named::ArrowDown) => Some(Message::PaletteMove(1)),
                 _ => None,
@@ -3649,6 +3879,129 @@ fn window_events(
 mod tests {
     use super::*;
 
+    struct TestWorkspace {
+        app: Notiz,
+        directory: std::path::PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!("notiz-ui-{}", Uuid::new_v4()));
+            let services =
+                AppServices::open(directory.join("vault"), directory.join("index.sqlite3"))
+                    .unwrap();
+            let first = services.create_note("First").unwrap();
+            let second = services.create_note("Second").unwrap();
+            let (mut app, _) = Notiz::new(services);
+            app.apply_snapshot(second.snapshot);
+            app.open_note_tab(first.context.note.id);
+            app.apply_context(first.context);
+            app.busy = false;
+            Self { app, directory }
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn navigation_waits_for_save_and_failed_save_keeps_editor() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        let first = app.active_note.as_ref().unwrap().id;
+        let second = app.notes.iter().find(|note| note.id != first).unwrap().id;
+        let _ = app.update(Message::TitleChanged("Unsaved title".into()));
+        let revision = app.revision;
+        let _ = app.update(Message::OpenNote(second));
+        assert!(app.saving);
+        assert_eq!(app.active_tab, Some(WorkspaceTab::Note(first)));
+        assert!(
+            matches!(app.deferred_action.as_deref(), Some(Message::OpenNote(id)) if *id == second)
+        );
+        let _ = app.update(Message::Saved(first, revision, Err("disk full".into())));
+        assert!(app.dirty);
+        assert!(!app.saving);
+        assert!(app.deferred_action.is_none());
+        assert_eq!(app.title, "Unsaved title");
+        assert_eq!(app.active_tab, Some(WorkspaceTab::Note(first)));
+    }
+
+    #[test]
+    fn edits_during_save_are_saved_again_before_closing_tab() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        let note = app.active_note.clone().unwrap();
+        let _ = app.update(Message::TitleChanged("First edit".into()));
+        let revision = app.revision;
+        let _ = app.update(Message::CloseTab(WorkspaceTab::Note(note.id)));
+        assert!(app.open_tabs.contains(&WorkspaceTab::Note(note.id)));
+        let mutation = app
+            .services
+            .save_note(
+                note.clone(),
+                app.title.clone(),
+                app.editor.text(),
+                app.tags.clone(),
+            )
+            .unwrap();
+        let _ = app.update(Message::TitleChanged("Second edit".into()));
+        let _ = app.update(Message::Saved(note.id, revision, Ok(mutation)));
+        assert!(app.saving && app.dirty);
+        assert!(app.deferred_action.is_some());
+        assert!(app.open_tabs.contains(&WorkspaceTab::Note(note.id)));
+        let revision = app.revision;
+        let mutation = app
+            .services
+            .save_note(
+                app.active_note.clone().unwrap(),
+                app.title.clone(),
+                app.editor.text(),
+                app.tags.clone(),
+            )
+            .unwrap();
+        let _ = app.update(Message::Saved(note.id, revision, Ok(mutation)));
+        assert!(!app.dirty);
+        assert!(!app.open_tabs.contains(&WorkspaceTab::Note(note.id)));
+        assert_eq!(
+            app.services.load_note(note.id).unwrap().note.title,
+            "Second edit"
+        );
+    }
+
+    #[test]
+    fn home_and_window_close_wait_for_pending_edits() {
+        for close_window in [false, true] {
+            let mut workspace = TestWorkspace::new();
+            let app = &mut workspace.app;
+            let tab = app.active_tab;
+            let _ = app.update(Message::TitleChanged("Keep this".into()));
+            let action = if close_window {
+                Message::CloseWindow(iced::window::Id::unique())
+            } else {
+                Message::OpenHome
+            };
+            let _ = app.update(action);
+            assert!(app.saving);
+            assert!(app.deferred_action.is_some());
+            assert_eq!(app.active_tab, tab);
+        }
+    }
+
+    #[test]
+    fn returning_from_home_restores_the_existing_note_without_reloading() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        let id = app.active_note.as_ref().unwrap().id;
+        let _ = app.update(Message::OpenHome);
+        assert_eq!(app.active_tab, None);
+        let _ = app.update(Message::OpenNote(id));
+        assert_eq!(app.active_tab, Some(WorkspaceTab::Note(id)));
+        assert!(!app.busy);
+    }
+
     #[test]
     fn recognizes_internal_preview_links() {
         assert_eq!(
@@ -3656,49 +4009,6 @@ mod tests {
             Some("Projeto Atlas".into())
         );
         assert_eq!(internal_link_target("https://example.com"), None);
-    }
-
-    #[test]
-    fn folder_reorder_keeps_descendants_with_their_parent() {
-        let mut folders = vec![
-            "Alpha".into(),
-            "Alpha/Child".into(),
-            "Beta".into(),
-            "Gamma".into(),
-        ];
-        assert!(reorder_folder_blocks(&mut folders, "Alpha", "Gamma"));
-        assert_eq!(folders, vec!["Beta", "Alpha", "Alpha/Child", "Gamma"]);
-    }
-
-    #[test]
-    fn adjacent_folder_reorder_is_stable_in_both_directions() {
-        let mut folders = vec![
-            "Alpha".into(),
-            "Alpha/Child".into(),
-            "Beta".into(),
-            "Beta/Child".into(),
-            "Gamma".into(),
-        ];
-        assert!(reorder_adjacent_folder_blocks(
-            &mut folders,
-            "Alpha",
-            "Beta",
-            true,
-        ));
-        assert_eq!(
-            folders,
-            vec!["Beta", "Beta/Child", "Alpha", "Alpha/Child", "Gamma"]
-        );
-        assert!(reorder_adjacent_folder_blocks(
-            &mut folders,
-            "Alpha",
-            "Beta",
-            false,
-        ));
-        assert_eq!(
-            folders,
-            vec!["Alpha", "Alpha/Child", "Beta", "Beta/Child", "Gamma"]
-        );
     }
 
     #[test]
