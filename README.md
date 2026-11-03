@@ -80,3 +80,7 @@ it does not delete notes; Notiz rebuilds it from Markdown.
 
 Changes are also saved automatically after a short idle period.
 
+## License
+
+Licensed under the [MIT License](LICENSE).
+

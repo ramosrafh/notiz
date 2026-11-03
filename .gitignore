@@ -1,8 +1,23 @@
+# Rust / Cargo
 /target
+**/*.rs.bk
+
+# Nix
 /.direnv
 /.envrc
 result
+result-*
+
+# SQLite index artifacts
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+
+# Local scratch
 query-on/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
