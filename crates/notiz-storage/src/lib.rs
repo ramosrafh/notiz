@@ -29,6 +29,8 @@ pub enum Error {
     InvalidId(#[from] uuid::Error),
     #[error("note does not exist: {0}")]
     NoteNotFound(Uuid),
+    #[error("graph coordinates must be finite")]
+    InvalidGraphPosition,
     #[error("unsafe note path: {0}")]
     UnsafePath(String),
     #[error("a file or folder already exists at: {0}")]
@@ -580,6 +582,36 @@ impl Vault {
         Ok(KnowledgeGraph { nodes, edges })
     }
 
+    /// Checks persisted presence rather than coordinates: the origin is a valid position.
+    pub fn has_unpositioned_graph_nodes(&self) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM notes n
+                 LEFT JOIN graph_positions p ON p.note_id = n.id
+                 WHERE p.note_id IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Upserts one indexed node atomically; never writes note files or timestamps.
+    pub fn save_graph_node_position(&self, id: Uuid, x: f32, y: f32) -> Result<()> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(Error::InvalidGraphPosition);
+        }
+        let changed = self.connect()?.execute(
+            "INSERT INTO graph_positions (note_id, x, y)
+             SELECT id, ?2, ?3 FROM notes WHERE id = ?1
+             ON CONFLICT(note_id) DO UPDATE SET x = excluded.x, y = excluded.y",
+            params![id.to_string(), x, y],
+        )?;
+        if changed == 0 {
+            return Err(Error::NoteNotFound(id));
+        }
+        Ok(())
+    }
+
     pub fn save_graph_positions(&self, graph: &KnowledgeGraph) -> Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
@@ -1026,6 +1058,61 @@ mod tests {
         let graph = vault.graph().expect("graph");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges[0].target, Some(atlas.id));
+        cleanup(&root, &index);
+    }
+
+    #[test]
+    fn graph_node_position_rejects_nonfinite_coordinates_without_writing() {
+        let (root, index) = temporary_vault();
+        let vault = Vault::open(&root, &index).unwrap();
+        let note = vault.create_note("First").unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (x, y) in [(value, 1.0), (1.0, value)] {
+                assert!(matches!(
+                    vault.save_graph_node_position(note.id, x, y),
+                    Err(Error::InvalidGraphPosition)
+                ));
+            }
+        }
+        let count: i64 = vault
+            .connect()
+            .unwrap()
+            .query_row("SELECT count(*) FROM graph_positions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        vault.save_graph_node_position(note.id, 1.25, -2.5).unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (x, y) in [(value, 1.0), (1.0, value)] {
+                assert!(matches!(
+                    vault.save_graph_node_position(note.id, x, y),
+                    Err(Error::InvalidGraphPosition)
+                ));
+            }
+        }
+        let graph = vault.graph().unwrap();
+        assert_eq!((graph.nodes[0].x, graph.nodes[0].y), (1.25, -2.5));
+        cleanup(&root, &index);
+    }
+
+    #[test]
+    fn graph_node_position_does_not_create_orphans_for_missing_or_deleted_notes() {
+        let (root, index) = temporary_vault();
+        let vault = Vault::open(&root, &index).unwrap();
+        let note = vault.create_note("Deleted").unwrap();
+        vault.delete_note(note.id).unwrap();
+        for id in [Uuid::new_v4(), note.id] {
+            assert!(matches!(
+                vault.save_graph_node_position(id, 1.0, 2.0),
+                Err(Error::NoteNotFound(missing)) if missing == id
+            ));
+        }
+        let count: i64 = vault
+            .connect()
+            .unwrap()
+            .query_row("SELECT count(*) FROM graph_positions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
         cleanup(&root, &index);
     }
 

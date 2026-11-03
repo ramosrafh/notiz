@@ -242,6 +242,11 @@ impl AppServices {
         self.current_snapshot()
     }
 
+    pub fn save_note_order(&self, note_ids: &[Uuid]) -> Result<AppSnapshot> {
+        self.vault.save_note_order(note_ids)?;
+        self.current_snapshot()
+    }
+
     pub fn save_tree_order(&self, folders: &[String], note_ids: &[Uuid]) -> Result<AppSnapshot> {
         self.vault.save_folder_order(folders)?;
         self.vault.save_note_order(note_ids)?;
@@ -324,6 +329,11 @@ impl AppServices {
         Ok(self.vault.resolve_target(target)?)
     }
 
+    /// Persists only this node's position, without changing the note or running layout.
+    pub fn save_graph_node_position(&self, id: Uuid, x: f32, y: f32) -> Result<()> {
+        Ok(self.vault.save_graph_node_position(id, x, y)?)
+    }
+
     pub fn vault_revision(&self) -> Result<u64> {
         Ok(self.vault.revision()?)
     }
@@ -343,11 +353,7 @@ impl AppServices {
 
     fn layout_and_persist_graph(&self) -> Result<KnowledgeGraph> {
         let mut graph = self.vault.graph()?;
-        if graph
-            .nodes
-            .iter()
-            .any(|node| node.x == 0.0 && node.y == 0.0)
-        {
+        if self.vault.has_unpositioned_graph_nodes()? {
             force_layout(&mut graph);
             self.vault.save_graph_positions(&graph)?;
         }
@@ -380,7 +386,7 @@ fn force_layout(graph: &mut KnowledgeGraph) {
     let tau = std::f32::consts::TAU;
     for (index, node) in graph.nodes.iter_mut().enumerate() {
         let angle = tau * index as f32 / count as f32;
-        let ring = 0.52 + (index % 5) as f32 * 0.045;
+        let ring = 0.62 + (index % 5) as f32 * 0.06;
         node.x = angle.cos() * ring;
         node.y = angle.sin() * ring;
     }
@@ -399,8 +405,8 @@ fn force_layout(graph: &mut KnowledgeGraph) {
         .iter()
         .filter_map(|edge| Some((*indices.get(&edge.source)?, *indices.get(&edge.target?)?)))
         .collect::<Vec<_>>();
-    let area = 4.0f32;
-    let ideal = (area / count as f32).sqrt().clamp(0.06, 0.45);
+    let area = 9.0f32;
+    let ideal = (area / count as f32).sqrt().clamp(0.14, 0.62);
 
     for iteration in 0..90 {
         let mut movement = vec![(0.0f32, 0.0f32); count];
@@ -430,7 +436,7 @@ fn force_layout(graph: &mut KnowledgeGraph) {
             movement[target].0 += move_x;
             movement[target].1 += move_y;
         }
-        let temperature = 0.09 * (1.0 - iteration as f32 / 90.0) + 0.008;
+        let temperature = 0.12 * (1.0 - iteration as f32 / 90.0) + 0.01;
         for (node, (dx, dy)) in graph.nodes.iter_mut().zip(movement) {
             let magnitude = (dx * dx + dy * dy).sqrt().max(0.001);
             node.x = (node.x + dx / magnitude * magnitude.min(temperature)).clamp(-1.0, 1.0);
@@ -620,6 +626,86 @@ mod tests {
             parse_tags("#Trabalho, rust trabalho"),
             vec!["trabalho", "rust"]
         );
+    }
+
+    #[test]
+    fn graph_node_position_survives_reopen_and_reindex_without_changing_other_nodes_or_notes() {
+        let directory = TestVault::new();
+        let services = directory.open("index.sqlite3");
+        let first = services.create_note("First").unwrap().context.note;
+        services.create_note("Second").unwrap();
+        let snapshot = services.create_note("Third").unwrap().snapshot;
+        let originals = snapshot
+            .notes
+            .iter()
+            .map(|summary| {
+                let note = services.load_note(summary.id).unwrap().note;
+                let bytes = std::fs::read(services.vault_path().join(&note.relative_path)).unwrap();
+                (note, bytes)
+            })
+            .collect::<Vec<_>>();
+        let other_positions = snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.id != first.id)
+            .map(|node| (node.id, node.x, node.y))
+            .collect::<Vec<_>>();
+        drop(services);
+
+        // Zero is also a saved position, not a request to rerun the layout.
+        for (x, y) in [(2.5, -3.75), (0.0, 0.0)] {
+            let services = directory.open("index.sqlite3");
+            services.save_graph_node_position(first.id, x, y).unwrap();
+            drop(services);
+            let reopened = directory.open("index.sqlite3");
+            let refreshed = reopened.refresh().unwrap();
+            let moved = refreshed
+                .graph
+                .nodes
+                .iter()
+                .find(|node| node.id == first.id)
+                .unwrap();
+            assert_eq!((moved.x, moved.y), (x, y));
+            assert_eq!(refreshed.notes, snapshot.notes);
+            assert_eq!(refreshed.vault_revision, snapshot.vault_revision);
+            for &(id, expected_x, expected_y) in &other_positions {
+                let node = refreshed
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .unwrap();
+                assert_eq!((node.x, node.y), (expected_x, expected_y));
+            }
+            for (note, bytes) in &originals {
+                assert_eq!(reopened.load_note(note.id).unwrap().note, *note);
+                assert_eq!(
+                    std::fs::read(reopened.vault_path().join(&note.relative_path)).unwrap(),
+                    *bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn graph_node_position_errors_propagate_from_storage() {
+        let directory = TestVault::new();
+        let services = directory.open("index.sqlite3");
+        let id = services.create_note("First").unwrap().context.note.id;
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (x, y) in [(value, 0.0), (0.0, value)] {
+                assert!(matches!(
+                    services.save_graph_node_position(id, x, y),
+                    Err(Error::Storage(notiz_storage::Error::InvalidGraphPosition))
+                ));
+            }
+        }
+        let missing = Uuid::new_v4();
+        assert!(matches!(
+            services.save_graph_node_position(missing, 1.0, 2.0),
+            Err(Error::Storage(notiz_storage::Error::NoteNotFound(id))) if id == missing
+        ));
     }
 
     #[test]

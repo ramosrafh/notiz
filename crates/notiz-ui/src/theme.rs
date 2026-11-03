@@ -36,7 +36,7 @@ pub fn panel(background: Color, border: Color, radius: f32) -> container::Style 
 
 pub fn note_button(active: bool, status: button::Status) -> button::Style {
     let background = if active {
-        Color::from_rgba(1.0, 0.78, 0.60, 0.20)
+        Color::from_rgba(1.0, 0.78, 0.60, 0.09)
     } else if matches!(status, button::Status::Hovered) {
         SURFACE_HOVER
     } else {
@@ -46,9 +46,9 @@ pub fn note_button(active: bool, status: button::Status) -> button::Style {
         background: Some(Background::Color(background)),
         text_color: if active { TEXT } else { MUTED },
         border: Border {
-            color: if active { INDIGO } else { Color::TRANSPARENT },
-            width: if active { 1.0 } else { 0.0 },
-            radius: 8.0.into(),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 6.0.into(),
         },
         shadow: Shadow::default(),
         snap: true,
@@ -177,7 +177,8 @@ pub fn palette_item(active: bool, status: button::Status) -> button::Style {
 
 pub fn ghost_button(_theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
-        background: matches!(status, button::Status::Hovered).then_some(Background::Color(SURFACE)),
+        background: matches!(status, button::Status::Hovered)
+            .then_some(Background::Color(SURFACE_HOVER)),
         text_color: if matches!(status, button::Status::Hovered) {
             TEXT
         } else {

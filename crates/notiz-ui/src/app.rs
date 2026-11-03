@@ -26,14 +26,15 @@ use crate::theme::{
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = 240.0;
 const SIDEBAR_MAX_WIDTH: f32 = 540.0;
-const SIDEBAR_COLLAPSED_WIDTH: f32 = 62.0;
+const SIDEBAR_COLLAPSED_WIDTH: f32 = 52.0;
 const SIDEBAR_RESIZE_WIDTH: f32 = 5.0;
-const TREE_INDENT: f32 = 18.0;
-const TREE_LEADING_WIDTH: f32 = 40.0;
+const TREE_INDENT: f32 = 16.0;
+const TREE_CHEVRON_WIDTH: f32 = 16.0;
+const TREE_LEADING_WIDTH: f32 = 20.0;
 const TREE_ACTION_WIDTH: f32 = 28.0;
 const TREE_ROW_PADDING_X: u16 = 8;
-const INSPECTOR_WIDTH: f32 = 280.0;
-const INSPECTOR_COLLAPSED_WIDTH: f32 = 56.0;
+const INSPECTOR_WIDTH: f32 = 300.0;
+const INSPECTOR_COLLAPSED_WIDTH: f32 = 52.0;
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
 const PREVIEW_DELAY: Duration = Duration::from_millis(140);
 const UI_FONT: Font = Font::with_name("Inter");
@@ -67,6 +68,22 @@ pub fn run(services: AppServices) -> iced::Result {
     .run()
 }
 
+#[derive(Debug, Clone)]
+struct LinkSuggestion {
+    title: String,
+    path: String,
+    target: String,
+}
+
+#[derive(Debug)]
+struct WikiLinkContext {
+    line: usize,
+    start: usize,
+    end: usize,
+    query: String,
+    suffix: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceMode {
     Editor,
@@ -78,13 +95,31 @@ enum WorkspaceMode {
 enum TreeSort {
     Alphabetical,
     Updated,
+    Manual,
 }
 
 impl TreeSort {
     fn label(self) -> &'static str {
         match self {
             Self::Alphabetical => "A–Z",
-            Self::Updated => "Updated",
+            Self::Updated => "Recent",
+            Self::Manual => "Manual",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Alphabetical => "\u{E415}",
+            Self::Updated => "\u{E1F5}",
+            Self::Manual => "\u{E106}",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Alphabetical => Self::Updated,
+            Self::Updated => Self::Manual,
+            Self::Manual => Self::Alphabetical,
         }
     }
 }
@@ -98,6 +133,7 @@ enum WorkspaceTab {
 #[derive(Debug, Clone)]
 enum PaletteAction {
     CreateNote,
+    CreateFolder,
     CreateFromTemplate(NoteTemplate),
     OpenTree,
     OpenGraph,
@@ -218,6 +254,12 @@ struct TreeHold {
 }
 
 #[derive(Debug, Clone)]
+struct EditorSnapshot {
+    text: String,
+    cursor: text_editor::Position,
+}
+
+#[derive(Debug, Clone)]
 enum Message {
     Initialized(Result<AppSnapshot, String>),
     SearchChanged(String),
@@ -246,8 +288,13 @@ enum Message {
     TitleChanged(String),
     TagsChanged(String),
     EditorAction(text_editor::Action),
+    MoveLinkSuggestion(i32),
+    AcceptLinkSuggestion(usize),
+    DismissLinkSuggestions,
     SetMode(WorkspaceMode),
-    ToggleEditorPreview,
+    VimMode(WorkspaceMode),
+    Undo,
+    Redo,
     SaveRequested,
     AutosaveTick,
     Saved(Uuid, u64, Result<MutationResult, String>),
@@ -256,6 +303,7 @@ enum Message {
     HoverNoteSelector(Option<Uuid>),
     HoverFolderSelector(Option<String>),
     HoverFolderNest(Option<String>),
+    HoverRootDrop(bool),
     ToggleFolderExpanded(String),
     ToggleNoteSelection(Uuid),
     ToggleFolderSelection(String),
@@ -268,11 +316,14 @@ enum Message {
     EndTreeInteraction,
     TreeNoteMoved(Uuid, Result<MutationResult, String>),
     TreeFolderMoved(String, Result<FolderMutationResult, String>),
+    TreeOrderSaved(Result<AppSnapshot, String>),
     RefreshRequested,
     Refreshed(Result<AppSnapshot, String>),
     MarkdownLinkClicked(markdown::Uri),
     LinkResolved(Result<Option<Uuid>, String>),
     Graph(graph::Message),
+    GraphPositionSaved(Result<(), String>),
+    ResetGraphView,
     ToggleSidebar,
     ToggleInspector,
     SidebarResizeStart,
@@ -331,12 +382,17 @@ struct Notiz {
     collapsed_folders: HashSet<String>,
     active_note: Option<Note>,
     editor: text_editor::Content,
+    undo_stack: Vec<EditorSnapshot>,
+    redo_stack: Vec<EditorSnapshot>,
+    last_snapshot_at: Option<std::time::Instant>,
     preview_blocks: Vec<PreviewBlock>,
     preview_document: selectable_preview::Document,
     title: String,
     tags: String,
     backlinks: Vec<Backlink>,
     graph: KnowledgeGraph,
+    graph_selected: Option<Uuid>,
+    graph_view_revision: u64,
     mode: WorkspaceMode,
     open_tabs: Vec<WorkspaceTab>,
     active_tab: Option<WorkspaceTab>,
@@ -352,6 +408,9 @@ struct Notiz {
     palette_query: String,
     palette_selected: usize,
     selected_line: usize,
+    link_suggestions: Vec<LinkSuggestion>,
+    link_suggestion_selected: usize,
+    link_popup_dismissed: bool,
     editor_scroll_ratio: f32,
     editor_scroll_target: f32,
     preview_scroll_ratio: f32,
@@ -422,12 +481,17 @@ impl Notiz {
                 collapsed_folders: HashSet::new(),
                 active_note: None,
                 editor: text_editor::Content::new(),
+                undo_stack: Vec::new(),
+                redo_stack: Vec::new(),
+                last_snapshot_at: None,
                 preview_blocks: build_preview_blocks(""),
                 preview_document: selectable_preview::Document::parse("*Empty note.*"),
                 title: String::new(),
                 tags: String::new(),
                 backlinks: Vec::new(),
                 graph: KnowledgeGraph::default(),
+                graph_selected: None,
+                graph_view_revision: 0,
                 mode: WorkspaceMode::Editor,
                 open_tabs: Vec::new(),
                 active_tab: None,
@@ -443,6 +507,9 @@ impl Notiz {
                 palette_query: String::new(),
                 palette_selected: 0,
                 selected_line: 0,
+                link_suggestions: Vec::new(),
+                link_suggestion_selected: 0,
+                link_popup_dismissed: false,
                 editor_scroll_ratio: 0.0,
                 editor_scroll_target: 0.0,
                 preview_scroll_ratio: 0.0,
@@ -518,16 +585,21 @@ impl Notiz {
                 }
             }
             Message::CycleTreeSort => {
-                self.tree_sort = match self.tree_sort {
-                    TreeSort::Alphabetical => TreeSort::Updated,
-                    TreeSort::Updated => TreeSort::Alphabetical,
-                };
+                self.tree_sort = self.tree_sort.next();
                 self.status = match self.tree_sort {
                     TreeSort::Alphabetical => "Tree sorted alphabetically".into(),
                     TreeSort::Updated => "Tree sorted by latest update".into(),
+                    TreeSort::Manual => "Manual order · drag items to reorder".into(),
                 };
             }
             Message::OpenFolderCreator(folder) => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.palette_open = false;
+                self.search.clear();
+                self.visible_notes = self.notes.clone();
+                reveal_folder(&mut self.collapsed_folders, &folder);
                 self.context_menu = None;
                 self.note_creator_open = false;
                 self.note_creator_title.clear();
@@ -571,6 +643,16 @@ impl Notiz {
                 return self.update(Message::CreateNoteIn(self.selected_folder.clone()));
             }
             Message::CreateNoteIn(folder) => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.search.clear();
+                self.visible_notes = self.notes.clone();
+                reveal_folder(&mut self.collapsed_folders, &folder);
+                if self.sidebar_collapsed {
+                    self.sidebar_collapsed = false;
+                    self.sidebar_target = self.sidebar_expanded_width;
+                }
                 self.palette_open = false;
                 self.context_menu = None;
                 self.folder_creator_open = false;
@@ -632,6 +714,7 @@ impl Notiz {
                         self.apply_context(mutation.context);
                         self.mode = WorkspaceMode::Editor;
                         self.status = "Note created".into();
+                        return iced::widget::operation::focus(note_editor_id());
                     }
                     Err(error) => self.status = error,
                 }
@@ -682,11 +765,18 @@ impl Notiz {
                 if edited && self.busy {
                     return Task::none();
                 }
+                if edited {
+                    self.capture_undo_snapshot();
+                }
                 let scroll_lines = match &action {
                     text_editor::Action::Scroll { lines } => Some(*lines),
                     _ => None,
                 };
                 self.editor.perform(action);
+                if edited {
+                    self.link_popup_dismissed = false;
+                }
+                self.refresh_link_suggestions();
                 if edited {
                     self.preview_dirty = true;
                     self.mark_dirty();
@@ -711,7 +801,34 @@ impl Notiz {
                     self.preview_scroll_target = self.preview_ratio_for_line(sync_line);
                 }
             }
+            Message::MoveLinkSuggestion(delta) => {
+                if !self.link_suggestions.is_empty() {
+                    self.link_suggestion_selected = (self.link_suggestion_selected as i32 + delta)
+                        .rem_euclid(self.link_suggestions.len() as i32)
+                        as usize;
+                }
+            }
+            Message::DismissLinkSuggestions => {
+                self.link_suggestions.clear();
+                self.link_popup_dismissed = true;
+            }
+            Message::AcceptLinkSuggestion(index) => {
+                if self.busy {
+                    return Task::none();
+                }
+                let Some(suggestion) = self.link_suggestions.get(index).cloned() else {
+                    return Task::none();
+                };
+                if complete_wikilink(&mut self.editor, &suggestion.target) {
+                    self.preview_dirty = true;
+                    self.mark_dirty();
+                    self.link_suggestions.clear();
+                    self.link_popup_dismissed = false;
+                    return iced::widget::operation::focus(note_editor_id());
+                }
+            }
             Message::SetMode(mode) => {
+                self.link_suggestions.clear();
                 if mode != WorkspaceMode::Preview
                     && self.mode == WorkspaceMode::Preview
                     && (self.editor.line_count() > 350
@@ -735,13 +852,17 @@ impl Notiz {
                     self.preview_scroll_target = self.preview_ratio_for_line(self.selected_line);
                 }
             }
-            Message::ToggleEditorPreview => {
-                let mode = match self.mode {
-                    WorkspaceMode::Editor | WorkspaceMode::Split => WorkspaceMode::Preview,
-                    WorkspaceMode::Preview => WorkspaceMode::Editor,
-                };
-                return self.update(Message::SetMode(mode));
+            Message::VimMode(mode) => {
+                // Vim-like view switch (i/e = edit, r = read, s = split). The editor keeps focus
+                // so Split keeps you typing in its editor pane, Preview just reads.
+                let mut tasks = vec![self.update(Message::SetMode(mode))];
+                if mode != WorkspaceMode::Preview {
+                    tasks.push(iced::widget::operation::focus(note_editor_id()));
+                }
+                return Task::batch(tasks);
             }
+            Message::Undo => return self.apply_history(true),
+            Message::Redo => return self.apply_history(false),
             Message::ActivateWorkspaceMode(mode) => {
                 if self.workspace_loading == Some(mode) {
                     self.mode = mode;
@@ -829,6 +950,14 @@ impl Notiz {
             Message::HoverFolderNest(folder) => {
                 if self.tree_drag.is_some() {
                     self.tree_nest_target = folder;
+                }
+            }
+            Message::HoverRootDrop(active) => {
+                // Hovering the tree's free area means "drop at Root": clear any
+                // row target so the whole background lights up as the drop zone.
+                if self.tree_drag.is_some() && active {
+                    self.tree_drop_target = None;
+                    self.tree_nest_target = None;
                 }
             }
             Message::ToggleFolderExpanded(folder) => {
@@ -1048,6 +1177,13 @@ impl Notiz {
                 }
                 Err(error) => self.status = error,
             },
+            Message::TreeOrderSaved(result) => match result {
+                Ok(snapshot) => {
+                    self.apply_snapshot(snapshot);
+                    self.status = "Order updated".into();
+                }
+                Err(error) => self.status = error,
+            },
             Message::RefreshRequested => {
                 if self.dirty {
                     return self.save_task();
@@ -1090,6 +1226,30 @@ impl Notiz {
                 Ok(None) => self.status = "No note matches this link yet".into(),
                 Err(error) => self.status = error,
             },
+            Message::Graph(graph::Message::SelectNode(id)) => {
+                self.graph_selected = Some(id);
+            }
+            Message::Graph(graph::Message::NodeMoved(id, x, y)) => {
+                if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == id) {
+                    node.x = x;
+                    node.y = y;
+                    self.graph_selected = Some(id);
+                    return service_task(
+                        self.services.clone(),
+                        move |services| services.save_graph_node_position(id, x, y),
+                        Message::GraphPositionSaved,
+                    );
+                }
+            }
+            Message::GraphPositionSaved(result) => {
+                self.status = match result {
+                    Ok(()) => "Node position saved".into(),
+                    Err(error) => format!("Could not save position: {error}"),
+                };
+            }
+            Message::ResetGraphView => {
+                self.graph_view_revision = self.graph_view_revision.wrapping_add(1);
+            }
             Message::Graph(graph::Message::OpenNote(id)) => {
                 return self.update(Message::OpenNote(id));
             }
@@ -1364,6 +1524,9 @@ impl Notiz {
                     PaletteAction::CreateNote => {
                         self.update(Message::CreateNoteIn(self.selected_folder.clone()))
                     }
+                    PaletteAction::CreateFolder => {
+                        self.update(Message::OpenFolderCreator(String::new()))
+                    }
                     PaletteAction::OpenTree => {
                         if self.sidebar_collapsed {
                             self.sidebar_collapsed = false;
@@ -1585,6 +1748,9 @@ impl Notiz {
                 let overlay = pin(opaque(self.tree_context_menu(&menu.target))).x(x).y(y);
                 return stack![base, backdrop, overlay].into();
             }
+            if let Some(ghost) = self.tree_drag_ghost() {
+                return stack![base, ghost].into();
+            }
             return base;
         }
 
@@ -1618,149 +1784,163 @@ impl Notiz {
 
     fn sidebar(&self) -> Element<'_, Message> {
         if self.sidebar_width < 170.0 {
-            let mut rail = column![
-                button(lucide_icon("\u{E12A}").size(20).color(MUTED))
-                    .on_press(Message::ToggleSidebar)
-                    .padding([9, 12])
-                    .style(theme::ghost_button),
-            ]
-            .spacing(10)
-            .align_x(iced::Alignment::Center);
-            rail = rail
-                .push(
-                    button(lucide_icon("\u{E33C}").size(17).color(MUTED))
-                        .on_press(Message::ToggleSidebar)
-                        .padding([10, 13])
-                        .style(theme::ghost_button),
-                )
-                .push(tooltip(
-                    button(lucide_icon("\u{E130}").size(17).color(INDIGO))
-                        .on_press(Message::OpenHome)
-                        .padding([10, 13])
-                        .style(theme::ghost_button),
-                    text("Início").size(12),
-                    tooltip::Position::Right,
-                ))
-                .push(
-                    button(lucide_icon("\u{E125}").size(17).color(MUTED))
-                        .on_press(Message::OpenGraph)
-                        .padding([10, 13])
-                        .style(theme::ghost_button),
-                );
-            return container(rail.padding([14, 8]))
-                .width(self.sidebar_width)
-                .height(Fill)
-                .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
-                .into();
+            return container(
+                column![
+                    self.icon_button("\u{E21D}", "Expand panel", Message::ToggleSidebar),
+                    self.icon_button("\u{E0F5}", "Home", Message::OpenHome),
+                    self.icon_button("\u{E0C9}", "New note · Ctrl+N", Message::CreateNote),
+                    self.icon_button("\u{E151}", "Commands · Ctrl+K", Message::TogglePalette),
+                    self.icon_button("\u{E125}", "Graph", Message::OpenGraph),
+                    Space::new().height(Fill),
+                    self.icon_button("\u{E0D7}", "Switch vault", Message::ToggleVaultManager),
+                ]
+                .spacing(8)
+                .align_x(iced::Alignment::Center)
+                .padding([12, 6]),
+            )
+            .width(self.sidebar_width)
+            .height(Fill)
+            .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
+            .into();
         }
 
         let header = row![
-            column![
-                text("Notiz").size(24).color(TEXT),
-                text(format!("{} notes", self.notes.len()))
-                    .size(12)
-                    .color(MUTED),
-            ]
-            .spacing(2)
-            .width(Fill),
-            button(lucide_icon("\u{E21C}").size(20).color(MUTED))
-                .on_press(Message::ToggleSidebar)
-                .padding([7, 10])
-                .style(theme::ghost_button),
+            text("Notiz").size(20).color(TEXT).width(Fill),
+            self.icon_button("\u{E09A}", "Commands · Ctrl+K", Message::TogglePalette),
+            self.icon_button("\u{E21C}", "Collapse panel", Message::ToggleSidebar),
         ]
-        .spacing(7)
+        .spacing(2)
         .align_y(iced::Alignment::Center);
 
-        let footer = column![
+        let vault_name = Path::new(&self.vault_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Vault");
+        let footer = tooltip(
             button(
                 row![
-                    lucide_icon("\u{E125}").size(15).color(MUTED),
-                    text("Open graph").size(12).color(MUTED),
-                    Space::new().width(Fill),
-                    text(format!("{} nodes", self.graph.nodes.len()))
-                        .size(11)
-                        .color(DIM),
+                    lucide_icon("\u{E0D7}").size(16).color(MUTED),
+                    column![
+                        text(shorten(vault_name, 28)).size(12).color(TEXT),
+                        text(format!("{} notes · local", self.notes.len()))
+                            .size(10)
+                            .color(DIM),
+                    ]
+                    .spacing(3)
+                    .width(Fill),
+                    lucide_icon("\u{E06D}").size(14).color(DIM),
                 ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-            )
-            .on_press(Message::OpenGraph)
-            .width(Fill)
-            .padding([9, 10])
-            .style(theme::ghost_button),
-            text("VAULT").size(10).color(DIM),
-            button(
-                row![
-                    lucide_icon("\u{E40C}").size(13).color(MUTED),
-                    text(shorten(&self.vault_path, 34)).size(11).color(MUTED),
-                    Space::new().width(Fill),
-                    text("Change").size(10).color(DIM),
-                ]
-                .spacing(7)
+                .spacing(10)
                 .align_y(iced::Alignment::Center),
             )
             .on_press(Message::ToggleVaultManager)
+            .padding([12, 10])
             .width(Fill)
-            .padding([8, 9])
             .style(theme::ghost_button),
-        ]
-        .spacing(7);
+            text(&self.vault_path).size(11),
+            tooltip::Position::Top,
+        );
 
-        let shortcuts = column![
-            button(
-                row![
-                    text("Início").size(13),
-                    Space::new().width(Fill),
-                    text("⌂").size(16)
-                ]
-                .align_y(iced::Alignment::Center)
-            )
-            .on_press(Message::OpenHome)
-            .padding([9, 12])
-            .width(Fill)
-            .style(|_, status| theme::note_button(self.active_tab.is_none(), status)),
-            button(
-                row![
-                    text("Diário de hoje").size(13),
-                    Space::new().width(Fill),
-                    text("⇧ D").size(10).color(DIM)
-                ]
-                .align_y(iced::Alignment::Center)
-            )
-            .on_press_maybe(
-                (!self.busy).then_some(Message::CreateFromTemplate(NoteTemplate::Daily))
-            )
-            .padding([9, 12])
-            .width(Fill)
-            .style(theme::ghost_button),
-            row![
-                button(text("+ Sessão").size(12))
-                    .on_press_maybe(
-                        (!self.busy).then_some(Message::CreateFromTemplate(NoteTemplate::Session))
-                    )
-                    .width(Fill)
-                    .padding([9, 10])
-                    .style(theme::ghost_button),
-                button(text("+ Memória").size(12))
-                    .on_press_maybe(
-                        (!self.busy).then_some(Message::CreateFromTemplate(NoteTemplate::Memory))
-                    )
-                    .width(Fill)
-                    .padding([9, 10])
-                    .style(theme::ghost_button),
-            ]
-            .spacing(4),
+        let navigation = column![
+            self.navigation_button(
+                "\u{E0F5}",
+                "Home",
+                Message::OpenHome,
+                self.active_tab.is_none()
+            ),
+            self.navigation_button(
+                "\u{E125}",
+                "Graph",
+                Message::OpenGraph,
+                self.active_tab == Some(WorkspaceTab::Graph)
+            ),
         ]
-        .spacing(3);
+        .spacing(2);
         container(
-            column![header, shortcuts, self.tree_panel(), footer]
-                .spacing(12)
-                .padding(12),
+            column![header, navigation, self.tree_panel(), footer]
+                .spacing(14)
+                .padding([12, 10]),
         )
         .width(self.sidebar_width)
         .height(Fill)
         .style(|_| theme::panel(SIDEBAR, Color::TRANSPARENT, 0.0))
         .into()
+    }
+
+    fn icon_button<'a>(
+        &self,
+        icon: &'static str,
+        label: &'a str,
+        action: Message,
+    ) -> Element<'a, Message> {
+        tooltip(
+            button(container(lucide_icon(icon).size(16)).center(Fill))
+                .on_press(action)
+                .width(30)
+                .height(30)
+                .padding(0)
+                .style(theme::ghost_button),
+            text(label).size(11),
+            tooltip::Position::Bottom,
+        )
+        .into()
+    }
+
+    fn navigation_button<'a>(
+        &self,
+        icon: &'static str,
+        label: &'a str,
+        action: Message,
+        active: bool,
+    ) -> Element<'a, Message> {
+        button(
+            row![lucide_icon(icon).size(16), text(label).size(13)]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+        )
+        .on_press(action)
+        .width(Fill)
+        .padding([9, 10])
+        .style(move |_, status| theme::note_button(active, status))
+        .into()
+    }
+
+    fn tree_drag_ghost(&self) -> Option<Element<'_, Message>> {
+        let drag = self.tree_drag.as_ref().filter(|drag| drag.active)?;
+        let (icon, label) = match &drag.item {
+            TreeItem::Note(id) => (
+                "\u{E0CC}",
+                self.notes
+                    .iter()
+                    .find(|note| note.id == *id)
+                    .map(|note| note.title.clone())
+                    .unwrap_or_else(|| "Note".into()),
+            ),
+            TreeItem::Folder(folder) => (
+                "\u{E0D7}",
+                Path::new(folder)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(folder)
+                    .to_owned(),
+            ),
+        };
+        let chip = container(
+            row![
+                lucide_icon(icon).size(14).color(INDIGO_LIGHT),
+                text(shorten(&label, 32)).size(13).color(TEXT),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([7, 11])
+        .style(|_| theme::panel(SURFACE, INDIGO_LIGHT, 8.0));
+        Some(
+            pin(opaque(chip))
+                .x((self.cursor_x + 14.0).max(0.0))
+                .y((self.cursor_y + 12.0).max(0.0))
+                .into(),
+        )
     }
 
     fn tree_panel(&self) -> Element<'_, Message> {
@@ -1769,46 +1949,65 @@ impl Notiz {
             .on_input(Message::SearchChanged)
             .padding([10, 12])
             .size(14)
+            .width(Fill)
             .style(theme::input);
 
-        let search_controls = row![
-            search,
-            button(lucide_icon("\u{E0D7}").size(16).color(MUTED))
-                .on_press(Message::OpenFolderCreator(self.selected_folder.clone()))
-                .width(36)
-                .height(36)
-                .padding(0)
+        let mut actions = row![
+            tooltip(
+                button(
+                    row![
+                        lucide_icon(self.tree_sort.icon()).size(13),
+                        text(self.tree_sort.label()).size(11),
+                    ]
+                    .spacing(5)
+                    .align_y(iced::Alignment::Center)
+                )
+                .on_press(Message::CycleTreeSort)
+                .height(30)
+                .padding([0, 9])
                 .style(theme::ghost_button),
-            button(lucide_icon("\u{E151}").size(16).color(MUTED))
-                .on_press(Message::TogglePalette)
-                .width(36)
-                .height(36)
-                .padding(0)
-                .style(theme::ghost_button),
+                text("Toggle sort order").size(11),
+                tooltip::Position::Bottom,
+            ),
+            self.icon_button(
+                "\u{E0C9}",
+                "New note · Ctrl+N",
+                Message::CreateNoteIn(String::new())
+            ),
+            self.icon_button(
+                "\u{E0D9}",
+                "New folder",
+                Message::OpenFolderCreator(String::new())
+            ),
+        ]
+        .spacing(3)
+        .align_y(iced::Alignment::Center);
+        if !self.selected_notes.is_empty() || !self.selected_folders.is_empty() {
+            let count = self.selected_notes.len() + self.selected_folders.len();
+            actions = actions.push(tooltip(
+                button(
+                    row![
+                        lucide_icon("\u{E18E}").size(14),
+                        text(count.to_string()).size(11),
+                    ]
+                    .spacing(5)
+                    .align_y(iced::Alignment::Center),
+                )
+                .on_press(Message::DeleteSelection)
+                .height(30)
+                .padding([0, 9])
+                .style(theme::danger_button),
+                text("Delete selection").size(11),
+                tooltip::Position::Bottom,
+            ));
+        }
+        let tree_header = row![
+            text("FILES").size(11).color(DIM),
+            Space::new().width(Fill),
+            actions,
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
-
-        let mut tree_header = row![
-            text("NOTES").size(10).color(DIM),
-            Space::new().width(Fill),
-            button(text(self.tree_sort.label()).size(10).color(MUTED))
-                .on_press(Message::CycleTreeSort)
-                .height(28)
-                .padding([0, 8])
-                .style(theme::ghost_button),
-        ]
-        .align_y(iced::Alignment::Center);
-        if !self.selected_notes.is_empty() || !self.selected_folders.is_empty() {
-            tree_header = tree_header.push(
-                button(lucide_icon("\u{E18E}").size(15).color(DANGER))
-                    .on_press(Message::DeleteSelection)
-                    .width(28)
-                    .height(28)
-                    .padding(0)
-                    .style(theme::danger_button),
-            );
-        }
 
         let ordered_notes = self.ordered_visible_notes();
         let ordered_folders = self.ordered_folders();
@@ -1824,7 +2023,7 @@ impl Notiz {
             .copied()
             .filter(|note| note_folder(&note.relative_path).is_empty())
         {
-            list = list.push(self.note_card(note, 10.0));
+            list = list.push(self.note_card(note, TREE_CHEVRON_WIDTH));
         }
 
         for folder in &ordered_folders {
@@ -1854,19 +2053,15 @@ impl Notiz {
                     .size(16)
                     .into()
             } else {
-                container(
-                    lucide_icon(if expanded { "\u{E247}" } else { "\u{E0D7}" })
-                        .size(14)
-                        .color(if expanded { INDIGO_LIGHT } else { MUTED }),
-                )
-                .width(16)
-                .align_x(iced::alignment::Horizontal::Center)
-                .into()
+                lucide_icon(if expanded { "\u{E247}" } else { "\u{E0D7}" })
+                    .size(16)
+                    .color(if expanded { INDIGO_LIGHT } else { MUTED })
+                    .into()
             };
             let folder = folder.clone();
             let folder_selector = mouse_area(
                 container(folder_indicator)
-                    .width(22)
+                    .width(TREE_LEADING_WIDTH)
                     .align_x(iced::alignment::Horizontal::Center),
             )
             .on_enter(Message::HoverFolderSelector(Some(folder.clone())))
@@ -1874,8 +2069,9 @@ impl Notiz {
             let folder_body = mouse_area(
                 row![
                     text(label)
-                        .size(13)
-                        .color(if selected { TEXT } else { MUTED }),
+                        .size(14)
+                        .color(TEXT)
+                        .wrapping(iced::widget::text::Wrapping::None),
                     Space::new().width(Fill),
                 ]
                 .spacing(7)
@@ -1884,32 +2080,31 @@ impl Notiz {
             )
             .on_enter(Message::HoverFolderNest(Some(folder.clone())))
             .on_exit(Message::HoverFolderNest(None));
-            let folder_leading = row![
-                container(
-                    text(if expanded { "⌄" } else { "›" })
-                        .size(15)
-                        .color(if expanded { INDIGO_LIGHT } else { MUTED }),
-                )
-                .width(18)
-                .align_x(iced::alignment::Horizontal::Center),
-                folder_selector,
-            ]
-            .width(TREE_LEADING_WIDTH)
-            .spacing(0)
-            .align_y(iced::Alignment::Center);
+            let folder_chevron = container(
+                lucide_icon(if expanded { "\u{E06D}" } else { "\u{E06F}" })
+                    .size(13)
+                    .color(if expanded { INDIGO_LIGHT } else { MUTED }),
+            )
+            .width(TREE_CHEVRON_WIDTH)
+            .height(26)
+            .center_y(26)
+            .align_x(iced::alignment::Horizontal::Center);
             let add_note: Element<'_, Message> = container(if hovered {
-                button(text("+").size(16).color(MUTED))
-                    .on_press(Message::CreateNoteIn(folder.clone()))
-                    .width(TREE_ACTION_WIDTH)
-                    .height(26)
-                    .padding(0)
-                    .style(theme::ghost_button)
+                tooltip(
+                    button(container(lucide_icon("\u{E0C9}").size(14)).center(Fill))
+                        .on_press(Message::CreateNoteIn(folder.clone()))
+                        .width(TREE_ACTION_WIDTH)
+                        .height(26)
+                        .padding(0)
+                        .style(theme::ghost_button),
+                    text("New note here").size(11),
+                    tooltip::Position::Left,
+                )
+                .into()
             } else {
-                button(text("").size(16))
-                    .width(TREE_ACTION_WIDTH)
-                    .height(26)
-                    .padding(0)
-                    .style(theme::transparent_button)
+                let empty: Element<'_, Message> =
+                    Space::new().width(TREE_ACTION_WIDTH).height(26).into();
+                empty
             })
             .width(TREE_ACTION_WIDTH)
             .height(26)
@@ -1917,15 +2112,16 @@ impl Notiz {
             let folder_row = container(
                 row![
                     Space::new().width(depth as f32 * TREE_INDENT),
-                    folder_leading,
+                    folder_chevron,
+                    folder_selector,
                     folder_body,
                     add_note,
                 ]
-                .spacing(4)
+                .spacing(2)
                 .align_y(iced::Alignment::Center),
             )
             .width(Fill)
-            .padding([6, TREE_ROW_PADDING_X])
+            .padding([5, TREE_ROW_PADDING_X])
             .style(move |_| {
                 theme::folder_surface(
                     selected,
@@ -1953,10 +2149,10 @@ impl Notiz {
                     }),
             );
             if self.folder_creator_open && self.selected_folder == *folder {
-                list = list.push(self.tree_creator_input(depth, true));
+                list = list.push(self.tree_creator_input(depth + 1, true));
             }
             if self.note_creator_open && self.note_creator_folder == *folder {
-                list = list.push(self.tree_creator_input(depth, false));
+                list = list.push(self.tree_creator_input(depth + 1, false));
             }
             if expanded {
                 for note in ordered_notes
@@ -1964,7 +2160,7 @@ impl Notiz {
                     .copied()
                     .filter(|note| note_folder(&note.relative_path) == *folder)
                 {
-                    let note_indent = depth as f32 * TREE_INDENT + 10.0;
+                    let note_indent = (depth + 1) as f32 * TREE_INDENT + TREE_CHEVRON_WIDTH;
                     list = list.push(self.note_card(note, note_indent));
                 }
             }
@@ -1972,25 +2168,39 @@ impl Notiz {
 
         let drag_hint: Element<'_, Message> = if self.tree_drag.is_some() {
             container(
-                text("Drop on a folder to move · drag left to move out")
+                text("Drop on a sibling to reorder · push right to nest · drop in free space for Root")
                     .size(10)
-                    .color(INDIGO_LIGHT),
+                    .color(DIM),
             )
             .padding([7, 8])
-            .style(|_| theme::panel(SURFACE, BORDER, 7.0))
             .into()
         } else {
             Space::new().height(0).into()
         };
 
+        // The whole free area of the tree is the Root drop zone: it lights up
+        // whenever a drag is in progress and the cursor is not over a row.
+        let root_active = self.tree_drag.is_some() && self.tree_drop_target.is_none();
+        let tree_body = container(scrollable(list).height(Fill))
+            .height(Fill)
+            .padding(2)
+            .style(move |_| {
+                if root_active {
+                    theme::panel(SURFACE, INDIGO, 8.0)
+                } else {
+                    theme::panel(Color::TRANSPARENT, Color::TRANSPARENT, 8.0)
+                }
+            });
+
         column![
-            search_controls,
-            tree_header,
-            mouse_area(scrollable(list).height(Fill))
+            search,
+            container(tree_header).padding([0, TREE_ROW_PADDING_X]),
+            mouse_area(tree_body)
+                .on_enter(Message::HoverRootDrop(true))
                 .on_right_press(Message::OpenTreeContext(TreeContextTarget::Root)),
             drag_hint,
         ]
-        .spacing(8)
+        .spacing(10)
         .height(Fill)
         .into()
     }
@@ -1999,11 +2209,6 @@ impl Notiz {
         let active = self
             .active_tab
             .is_some_and(|tab| tab == WorkspaceTab::Note(note.id));
-        let excerpt = if note.excerpt.is_empty() {
-            note.relative_path.clone()
-        } else {
-            shorten(&note.excerpt, 56)
-        };
         let selected = self.selected_notes.contains(&note.id);
         let hovered = self.hovered_note == Some(note.id);
         let selector_hovered = self.hovered_note_selector == Some(note.id);
@@ -2019,12 +2224,15 @@ impl Notiz {
                 .size(16)
                 .into()
         } else {
-            Space::new().width(16).into()
+            lucide_icon("\u{E0CC}")
+                .size(15)
+                .color(if active { INDIGO } else { MUTED })
+                .into()
         };
         let id = note.id;
         let selector = mouse_area(
             container(selector)
-                .width(22)
+                .width(TREE_LEADING_WIDTH)
                 .align_x(iced::alignment::Horizontal::Center),
         )
         .on_enter(Message::HoverNoteSelector(Some(id)))
@@ -2033,28 +2241,21 @@ impl Notiz {
             row![
                 Space::new().width(indent),
                 selector,
-                column![
-                    text(&note.title)
-                        .size(13)
-                        .color(if active { TEXT } else { MUTED }),
-                    text(excerpt)
-                        .size(10)
-                        .color(DIM)
-                        .width(Fill)
-                        .wrapping(iced::widget::text::Wrapping::None),
-                ]
-                .spacing(1)
-                .width(Fill),
+                text(&note.title)
+                    .size(14)
+                    .color(if active { TEXT } else { MUTED })
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
             ]
-            .spacing(6)
+            .spacing(2)
             .align_y(iced::Alignment::Center),
         )
         .width(Fill)
-        .padding([7, TREE_ROW_PADDING_X])
+        .padding([5, TREE_ROW_PADDING_X])
         .style(move |_| {
             theme::note_surface(
                 active,
-                indent > TREE_LEADING_WIDTH,
+                indent > TREE_CHEVRON_WIDTH,
                 hovered,
                 dragging || drop_target,
                 self.tree_drag_progress,
@@ -2075,18 +2276,18 @@ impl Notiz {
     }
 
     fn inspector_panel(&self) -> Element<'_, Message> {
+        if !matches!(self.active_tab, Some(WorkspaceTab::Note(_))) {
+            return Space::new().width(0).into();
+        }
         if self.inspector_width < 160.0 {
             return container(
                 column![
-                    button(lucide_icon("\u{E431}").size(20).color(MUTED))
-                        .on_press(Message::ToggleInspector)
-                        .padding([8, 8])
-                        .style(theme::ghost_button),
+                    self.icon_button("\u{E434}", "Expand context", Message::ToggleInspector),
                     lucide_icon("\u{E102}").size(16).color(DIM),
                 ]
-                .spacing(13)
+                .spacing(8)
                 .align_x(iced::Alignment::Center)
-                .padding([12, 4]),
+                .padding([12, 6]),
             )
             .width(self.inspector_width)
             .height(Fill)
@@ -2213,24 +2414,15 @@ impl Notiz {
         container(
             column![
                 row![
-                    column![
-                        text("CONTEXT").size(13).color(TEXT),
-                        text(format!("{} references", self.backlinks.len()))
-                            .size(11)
-                            .color(DIM),
-                    ]
-                    .spacing(2)
-                    .width(Fill),
-                    button(lucide_icon("\u{E432}").size(20).color(MUTED))
-                        .on_press(Message::ToggleInspector)
-                        .padding([7, 10])
-                        .style(theme::ghost_button),
+                    text("Context").size(20).color(TEXT).width(Fill),
+                    self.icon_button("\u{E432}", "Collapse context", Message::ToggleInspector),
                 ]
+                .spacing(2)
                 .align_y(iced::Alignment::Center),
                 scrollable(body).height(Fill),
             ]
-            .spacing(12)
-            .padding(13),
+            .spacing(14)
+            .padding([12, 10]),
         )
         .width(self.inspector_width)
         .height(Fill)
@@ -2239,14 +2431,14 @@ impl Notiz {
     }
 
     fn home_workspace(&self) -> Element<'_, Message> {
-        let mut recent = column![text("RETOMAR DE ONDE PAROU").size(11).color(DIM)].spacing(8);
+        let mut recent = column![text("PICK UP WHERE YOU LEFT OFF").size(11).color(DIM)].spacing(8);
         let mut notes = self.notes.iter().collect::<Vec<_>>();
         notes.sort_by_key(|note| std::cmp::Reverse(note.updated_at));
         for note in notes.into_iter().take(7) {
             recent = recent.push(
                 button(
                     row![
-                        lucide_icon("\u{E130}").size(16).color(INDIGO),
+                        lucide_icon("\u{E0CC}").size(16).color(INDIGO),
                         column![
                             text(&note.title).size(14).color(TEXT),
                             text(&note.relative_path).size(11).color(DIM),
@@ -2268,68 +2460,59 @@ impl Notiz {
         }
         if self.notes.is_empty() {
             recent = recent.push(
-                text("Suas notas recentes aparecerão aqui.")
+                text("Your recent notes will appear here.")
                     .size(13)
                     .color(MUTED),
             );
         }
         let content = column![
-            text("SEU ESPAÇO PESSOAL").size(11).color(INDIGO),
-            text("Menos dispersão. Mais contexto.").size(32).color(TEXT),
-            text("Reúna seu dia, suas sessões e o que vale lembrar.\nTudo em Markdown, no seu computador.")
-                .size(15).color(MUTED),
-            Space::new().height(16),
-            self.template_button(NoteTemplate::Daily, "Diário de hoje", "Prioridades, registro e próximos passos", "\u{E130}"),
-            self.template_button(NoteTemplate::Session, "Nova sessão", "Contexto, decisões e continuidade", "\u{E05F}"),
-            self.template_button(NoteTemplate::Memory, "Nova memória", "Aprendizados e referências duráveis", "\u{E125}"),
-            button(text("+ Nota livre").size(13))
-                .on_press(Message::CreateNote)
+            text("Your ideas, connected.").size(30).color(TEXT),
+            text("A space to write, organize, and find your notes.")
+                .size(14)
+                .color(MUTED),
+            Space::new().height(12),
+            row![
+                button(
+                    row![lucide_icon("\u{E0C9}").size(16), text("New note").size(13)]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center)
+                )
+                .on_press(Message::CreateNoteIn(String::new()))
+                .padding([10, 14])
+                .style(theme::primary_button),
+                button(
+                    row![
+                        lucide_icon("\u{E151}").size(16),
+                        text("Search or run a command").size(13)
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                )
+                .on_press(Message::TogglePalette)
                 .padding([10, 14])
                 .style(theme::ghost_button),
-            Space::new().height(18),
+            ]
+            .spacing(8),
+            Space::new().height(24),
             recent,
-            Space::new().height(12),
-            text("Conecte ideias com [[links]]  ·  Ctrl+K para comandos  ·  Ctrl+Shift+D para hoje")
-                .size(11).color(DIM),
-            self.status_bar(),
+            Space::new().height(16),
+            text("Connect notes with [[links]] · Ctrl+N to create · Ctrl+K to search")
+                .size(11)
+                .color(DIM),
         ]
         .spacing(10)
-        .max_width(780)
-        .padding([28, 32]);
-        scrollable(
-            container(content)
-                .width(Fill)
-                .align_x(iced::Alignment::Center),
-        )
+        .max_width(740)
+        .padding([40, 32]);
+        column![
+            scrollable(
+                container(content)
+                    .width(Fill)
+                    .align_x(iced::Alignment::Center)
+            )
+            .height(Fill),
+            container(self.status_bar()).padding([8, 16]).width(Fill),
+        ]
         .height(Fill)
-        .into()
-    }
-
-    fn template_button<'a>(
-        &self,
-        template: NoteTemplate,
-        label: &'a str,
-        description: &'a str,
-        icon: &'static str,
-    ) -> Element<'a, Message> {
-        button(
-            row![
-                lucide_icon(icon).size(20).color(INDIGO),
-                column![
-                    text(label).size(15).color(TEXT),
-                    text(description).size(12).color(MUTED),
-                ]
-                .spacing(4)
-                .width(Fill),
-                text("→").size(18).color(DIM),
-            ]
-            .spacing(14)
-            .align_y(iced::Alignment::Center),
-        )
-        .on_press_maybe((!self.busy).then_some(Message::CreateFromTemplate(template)))
-        .width(Fill)
-        .padding([16, 18])
-        .style(|_, status| theme::note_button(false, status))
         .into()
     }
 
@@ -2348,13 +2531,13 @@ impl Notiz {
 
     fn tab_bar(&self) -> Element<'_, Message> {
         let mut tabs = row![tooltip(
-            button(lucide_icon("\u{E130}").size(16).color(INDIGO))
+            button(lucide_icon("\u{E0F5}").size(16).color(INDIGO))
                 .on_press(Message::OpenHome)
                 .width(34)
                 .height(38)
                 .padding(8)
                 .style(theme::ghost_button),
-            text("Início").size(12),
+            text("Home").size(12),
             tooltip::Position::Bottom,
         )]
         .spacing(7)
@@ -2433,7 +2616,7 @@ impl Notiz {
         let active = self.active_tab == Some(tab);
         let label = self.tab_label(tab);
         let icon = match tab {
-            WorkspaceTab::Note(_) => "\u{E130}",
+            WorkspaceTab::Note(_) => "\u{E0CC}",
             WorkspaceTab::Graph => "\u{E125}",
         };
         let tab_content = container(
@@ -2509,42 +2692,143 @@ impl Notiz {
             .iter()
             .filter(|edge| edge.target.is_none())
             .count();
+        let selected = self
+            .graph_selected
+            .and_then(|id| self.graph.nodes.iter().find(|node| node.id == id));
+        let details: Element<'_, Message> = if let Some(node) = selected {
+            let mut links = column![].spacing(5);
+            for edge in &self.graph.edges {
+                let (label, target) = if edge.source == node.id {
+                    if let Some(id) = edge.target {
+                        (
+                            self.graph
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == id)
+                                .map(|node| format!("→ {}", node.title))
+                                .unwrap_or_default(),
+                            Some(id),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "→ {} · not created",
+                                edge.unresolved_target.as_deref().unwrap_or("Note")
+                            ),
+                            None,
+                        )
+                    }
+                } else if edge.target == Some(node.id) {
+                    (
+                        self.graph
+                            .nodes
+                            .iter()
+                            .find(|node| node.id == edge.source)
+                            .map(|node| format!("← {}", node.title))
+                            .unwrap_or_default(),
+                        Some(edge.source),
+                    )
+                } else {
+                    continue;
+                };
+                if let Some(id) = target {
+                    links = links.push(
+                        button(text(label).size(12))
+                            .on_press(Message::Graph(graph::Message::SelectNode(id)))
+                            .padding([8, 9])
+                            .width(Fill)
+                            .style(theme::ghost_button),
+                    );
+                } else {
+                    links = links.push(container(text(label).size(12).color(DIM)).padding([8, 9]));
+                }
+            }
+            if !self
+                .graph
+                .edges
+                .iter()
+                .any(|edge| edge.source == node.id || edge.target == Some(node.id))
+            {
+                links = links.push(
+                    text("This note has no connections yet.")
+                        .size(12)
+                        .color(DIM),
+                );
+            }
+            container(
+                column![
+                    text(&node.title).size(16).color(TEXT),
+                    button(text("Open note").size(12))
+                        .on_press(Message::OpenNote(node.id))
+                        .padding([8, 10])
+                        .style(theme::primary_button),
+                    text("RELATIONS").size(10).color(DIM),
+                    scrollable(links).height(Fill),
+                    text("→ links to · ← linked from").size(10).color(DIM),
+                ]
+                .spacing(14)
+                .padding(16),
+            )
+            .width(250)
+            .height(Fill)
+            .style(|_| theme::panel(SURFACE, Color::TRANSPARENT, 8.0))
+            .into()
+        } else {
+            container(
+                column![
+                    text("Explore your connections").size(15).color(TEXT),
+                    text("Select a note in the graph to see links coming in and going out.")
+                        .size(12)
+                        .color(MUTED),
+                    text("Create relations in the text using [[Note name]].")
+                        .size(12)
+                        .color(DIM),
+                ]
+                .spacing(12)
+                .padding(16),
+            )
+            .width(250)
+            .height(Fill)
+            .style(|_| theme::panel(SURFACE, Color::TRANSPARENT, 8.0))
+            .into()
+        };
+        let graph_content = row![
+            graph::view(&self.graph, self.graph_selected, self.graph_view_revision)
+                .map(Message::Graph),
+            details,
+        ]
+        .spacing(12)
+        .height(Fill);
         container(
             column![
                 row![
                     column![
-                        text("Knowledge graph").size(18).color(TEXT),
-                        text(format!(
-                            "{} nodes · {} relationships · {unresolved} unresolved links",
-                            self.graph.nodes.len(),
-                            self.graph.edges.len()
-                        ))
-                        .size(10)
-                        .color(MUTED),
-                    ]
-                    .spacing(3),
-                    Space::new().width(Fill),
-                    button(lucide_icon("\u{E145}").size(15).color(MUTED))
-                        .on_press(Message::RefreshRequested)
-                        .padding([8, 10])
-                        .style(theme::ghost_button),
-                ]
-                .align_y(iced::Alignment::Center),
-                container(
-                    graph::view(&self.graph, self.active_note.as_ref().map(|note| note.id))
-                        .map(Message::Graph),
-                )
-                .width(Fill)
-                .height(Fill)
-                .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0)),
-            ]
-            .spacing(8)
-            .padding(12),
+                        text("Notes graph").size(18).color(TEXT),
+                        text(format!("{} notes · {} relations · {unresolved} unlinked", self.graph.nodes.len(), self.graph.edges.len()))
+                            .size(11).color(MUTED),
+                    ].spacing(4).width(Fill),
+                    button(text("Center").size(12)).on_press(Message::ResetGraphView)
+                        .padding([8, 10]).style(theme::ghost_button),
+                    self.icon_button("\u{E145}", "Refresh relations", Message::RefreshRequested),
+                ].spacing(8).align_y(iced::Alignment::Center),
+                text("Drag a node to move · drag the background to pan · scroll to zoom · click to see relations · double-click to open")
+                    .size(11).color(DIM),
+                graph_content,
+                text("Connections are created with [[Note name]] in Markdown.").size(11).color(MUTED),
+                self.status_bar(),
+            ].spacing(12).padding(16),
         )
-        .width(Fill)
-        .height(Fill)
-        .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0))
-        .into()
+        .width(Fill).height(Fill)
+        .style(|_| theme::panel(BACKGROUND, Color::TRANSPARENT, 0.0)).into()
+    }
+
+    fn mode_button<'a>(&self, mode: WorkspaceMode, label: &'a str) -> Element<'a, Message> {
+        let active = self.mode == mode;
+        button(text(label).size(13))
+            .on_press(Message::SetMode(mode))
+            .padding([6, 12])
+            .style(move |_, status| theme::note_button(active, status))
+            .into()
     }
 
     fn note_workspace(&self) -> Element<'_, Message> {
@@ -2574,54 +2858,56 @@ impl Notiz {
         let title = text_input("Title", &self.title)
             .on_input(Message::TitleChanged)
             .padding([6, 8])
-            .size(20)
+            .size(22)
             .style(theme::inline_input);
-        let mode_icon = match self.mode {
-            WorkspaceMode::Editor | WorkspaceMode::Split => "\u{E130}",
-            WorkspaceMode::Preview => "\u{E05F}",
-        };
-        let split_active = self.mode == WorkspaceMode::Split;
         let header = row![
             title,
-            button(lucide_icon(mode_icon).size(18).color(MUTED))
-                .on_press(Message::ToggleEditorPreview)
-                .padding([8, 10])
-                .style(theme::ghost_button),
-            button(
-                lucide_icon("\u{E099}")
-                    .size(19)
-                    .color(if split_active { TEXT } else { MUTED })
+            container(
+                row![
+                    self.mode_button(WorkspaceMode::Editor, "Edit"),
+                    self.mode_button(WorkspaceMode::Preview, "Read"),
+                    self.mode_button(WorkspaceMode::Split, "Split"),
+                ]
+                .spacing(2)
             )
-            .on_press(Message::SetMode(WorkspaceMode::Split))
-            .padding([8, 10])
-            .style(move |_, status| theme::note_button(split_active, status)),
-            button(lucide_icon("\u{E151}").size(18).color(MUTED))
-                .on_press(Message::ToggleNoteSearch)
-                .padding([8, 10])
-                .style(theme::ghost_button),
-            button(text("↻").size(17))
-                .on_press(Message::RefreshRequested)
-                .padding([5, 11])
-                .style(theme::ghost_button),
+            .padding(3)
+            .style(|_| theme::panel(SURFACE, Color::TRANSPARENT, 7.0)),
+            self.icon_button(
+                "\u{E151}",
+                "Search in this note · Ctrl+F",
+                Message::ToggleNoteSearch
+            ),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
         let tags = row![
-            text("#").size(15).color(INDIGO_LIGHT),
-            text_input("tags separated by commas", &self.tags)
+            text("#").size(16).color(INDIGO_LIGHT),
+            text_input("Tags, comma separated", &self.tags)
                 .on_input(Message::TagsChanged)
                 .padding([5, 8])
-                .size(12)
+                .size(13)
                 .style(theme::inline_input),
-            text(
-                self.active_note
-                    .as_ref()
-                    .map(|note| note.relative_path.as_str())
-                    .unwrap_or_default(),
-            )
-            .size(10)
-            .color(DIM),
+            tooltip(
+                text(shorten(
+                    self.active_note
+                        .as_ref()
+                        .map(|note| note.relative_path.as_str())
+                        .unwrap_or_default(),
+                    30
+                ))
+                .size(10)
+                .color(DIM)
+                .wrapping(iced::widget::text::Wrapping::None),
+                text(
+                    self.active_note
+                        .as_ref()
+                        .map(|note| note.relative_path.as_str())
+                        .unwrap_or_default()
+                )
+                .size(11),
+                tooltip::Position::Bottom,
+            ),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
@@ -2728,30 +3014,97 @@ impl Notiz {
         .into()
     }
 
+    fn refresh_link_suggestions(&mut self) {
+        self.link_suggestion_selected = 0;
+        self.link_suggestions = if self.link_popup_dismissed || self.busy {
+            Vec::new()
+        } else {
+            wikilink_suggestions(&self.editor, &self.notes)
+        };
+    }
+
     fn editor_view(&self) -> Element<'_, Message> {
-        let editor = text_editor(&self.editor)
-            .on_action(Message::EditorAction)
-            .height(Fill)
-            .font(CODE_FONT)
-            .size(14)
-            .line_height(1.6)
-            .padding([20, 24])
-            .highlight_with::<SearchHighlighter>(
-                self.note_search_query.clone(),
-                search_highlight_format,
+        let has_suggestions = !self.link_suggestions.is_empty();
+        let selected = self.link_suggestion_selected;
+        iced::widget::responsive(move |size| {
+            // Keep the same widget tree while the popup opens, preserving editor focus and scroll.
+            let editor = text_editor(&self.editor)
+                .id(note_editor_id())
+                .key_binding(move |press| link_editor_binding(press, has_suggestions, selected))
+                .on_action(Message::EditorAction)
+                .height(Fill)
+                .font(CODE_FONT)
+                .size(15)
+                .line_height(1.65)
+                .padding([20, 24])
+                .highlight_with::<SearchHighlighter>(
+                    self.note_search_query.clone(),
+                    search_highlight_format,
+                )
+                .style(|_, _| text_editor::Style {
+                    background: Background::Color(BACKGROUND),
+                    border: Border::default(),
+                    placeholder: DIM,
+                    value: TEXT,
+                    selection: Color::from_rgba(1.0, 0.78, 0.60, 0.42),
+                });
+            let mut layers = stack![editor];
+            if !has_suggestions {
+                return layers.into();
+            }
+            let mut suggestions = column![].spacing(2);
+            for (index, suggestion) in self.link_suggestions.iter().enumerate() {
+                let active = index == selected;
+                suggestions = suggestions.push(
+                    button(
+                        row![
+                            lucide_icon("\u{E0CC}").size(14).color(INDIGO),
+                            column![
+                                text(&suggestion.title)
+                                    .size(12)
+                                    .color(TEXT)
+                                    .wrapping(iced::widget::text::Wrapping::None),
+                                text(&suggestion.path)
+                                    .size(10)
+                                    .color(DIM)
+                                    .wrapping(iced::widget::text::Wrapping::None),
+                            ]
+                            .spacing(2)
+                            .width(Fill),
+                            text(if active { "Tab" } else { "" }).size(10).color(MUTED),
+                        ]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .on_press(Message::AcceptLinkSuggestion(index))
+                    .padding([8, 10])
+                    .width(Fill)
+                    .style(move |_, status| theme::note_button(active, status)),
+                );
+            }
+            let width = (size.width - 32.0).clamp(180.0, 400.0);
+            let popup_height = self.link_suggestions.len() as f32 * 48.0 + 58.0;
+            let cursor = self.editor.cursor().position;
+            let x = (24.0 + cursor.column as f32 * 9.0).min((size.width - width - 12.0).max(12.0));
+            let y = (20.0 + (cursor.line + 1) as f32 * 24.75)
+                .min((size.height - popup_height - 12.0).max(12.0));
+            let popup = container(
+                column![
+                    text("LINK NOTE").size(9).color(DIM),
+                    suggestions,
+                    text("↑ ↓ select · Tab complete · Esc dismiss")
+                        .size(10)
+                        .color(MUTED),
+                ]
+                .spacing(8)
+                .padding(10),
             )
-            .style(|_, _| text_editor::Style {
-                background: Background::Color(BACKGROUND),
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 0.0.into(),
-                },
-                placeholder: DIM,
-                value: TEXT,
-                selection: Color::from_rgba(1.0, 0.78, 0.60, 0.42),
-            });
-        container(editor).width(Fill).height(Fill).into()
+            .width(width)
+            .style(|_| theme::panel(SURFACE, BORDER, 8.0));
+            layers = layers.push(pin(opaque(popup)).position(iced::Point::new(x, y)));
+            layers.into()
+        })
+        .into()
     }
 
     fn preview_view(&self) -> Element<'_, Message> {
@@ -2759,10 +3112,19 @@ impl Notiz {
             .preview_document
             .view(&self.note_search_query)
             .map(Message::MarkdownLinkClicked);
-        let preview = scrollable(container(document).width(Fill).padding([22, 26]))
-            .id(preview_scroll_id())
-            .on_scroll(|viewport| Message::PreviewScrolled(viewport.relative_offset().y))
-            .height(Fill);
+        let preview = scrollable(
+            container(
+                container(document)
+                    .width(Fill)
+                    .max_width(860)
+                    .padding([28, 32]),
+            )
+            .width(Fill)
+            .align_x(iced::Alignment::Center),
+        )
+        .id(preview_scroll_id())
+        .on_scroll(|viewport| Message::PreviewScrolled(viewport.relative_offset().y))
+        .height(Fill);
         container(preview)
             .width(Fill)
             .height(Fill)
@@ -2842,28 +3204,51 @@ impl Notiz {
             Message::ConfirmCreateNote
         };
         let placeholder = if is_folder {
-            "New folder…"
+            "Folder name"
         } else {
-            "New note…"
+            "Note title"
         };
+        let input = text_input(placeholder, value)
+            .id(if is_folder {
+                folder_input_id()
+            } else {
+                note_creator_title_id()
+            })
+            .on_input(message)
+            .on_submit(submit.clone())
+            .padding([8, 10])
+            .size(13)
+            .width(Fill)
+            .style(theme::input);
+        let can_submit = !value.trim().is_empty();
         container(
             row![
-                Space::new().width(depth as f32 * TREE_INDENT + TREE_LEADING_WIDTH + 4.0),
-                text_input(placeholder, value)
-                    .id(if is_folder {
-                        folder_input_id()
-                    } else {
-                        note_creator_title_id()
-                    })
-                    .on_input(message)
-                    .on_submit(submit)
-                    .padding([7, 9])
-                    .size(12)
-                    .style(theme::inline_input),
+                lucide_icon(if is_folder { "\u{E0D9}" } else { "\u{E0C9}" })
+                    .size(15)
+                    .color(INDIGO),
+                input,
+                button(lucide_icon("\u{E06C}").size(15))
+                    .on_press_maybe(can_submit.then_some(submit))
+                    .width(30)
+                    .height(30)
+                    .padding(0)
+                    .style(theme::primary_button),
+                button(lucide_icon("\u{E1B2}").size(15))
+                    .on_press(Message::CancelCreators)
+                    .width(30)
+                    .height(30)
+                    .padding(0)
+                    .style(theme::ghost_button),
             ]
+            .spacing(6)
             .align_y(iced::Alignment::Center),
         )
-        .padding([4, TREE_ROW_PADDING_X])
+        .padding(Padding {
+            top: 6.0,
+            bottom: 6.0,
+            left: 6.0 + depth as f32 * TREE_INDENT,
+            right: 6.0,
+        })
         .width(Fill)
         .into()
     }
@@ -2923,7 +3308,7 @@ impl Notiz {
 
     fn command_palette(&self) -> Element<'_, Message> {
         let entries = self.palette_entries();
-        let input = text_input("Type a command or note name…", &self.palette_query)
+        let input = text_input("Search command or note…", &self.palette_query)
             .id(palette_input_id())
             .on_input(Message::PaletteQueryChanged)
             .on_submit(Message::PaletteSubmit)
@@ -2977,23 +3362,14 @@ impl Notiz {
 
     fn palette_entries(&self) -> Vec<PaletteEntry> {
         let commands = [
-            ("Create new note", "Ctrl+N", PaletteAction::CreateNote),
+            ("New note", "Ctrl+N", PaletteAction::CreateNote),
+            ("New folder", "Files", PaletteAction::CreateFolder),
             (
-                "Abrir diário de hoje",
+                "Open today's daily",
                 "Ctrl+Shift+D",
                 PaletteAction::CreateFromTemplate(NoteTemplate::Daily),
             ),
-            (
-                "Nova sessão",
-                "Sessions",
-                PaletteAction::CreateFromTemplate(NoteTemplate::Session),
-            ),
-            (
-                "Nova memória",
-                "Memory",
-                PaletteAction::CreateFromTemplate(NoteTemplate::Memory),
-            ),
-            ("Open note tree", "Sidebar", PaletteAction::OpenTree),
+            ("Open files", "Side panel", PaletteAction::OpenTree),
             ("Open graph", "New tab", PaletteAction::OpenGraph),
             (
                 "Open backlinks",
@@ -3002,17 +3378,17 @@ impl Notiz {
             ),
             (
                 "Show editor",
-                "View",
+                "View · i",
                 PaletteAction::SetMode(WorkspaceMode::Editor),
             ),
             (
                 "Show preview",
-                "View",
+                "View · r",
                 PaletteAction::SetMode(WorkspaceMode::Preview),
             ),
             (
                 "Show editor and preview",
-                "Split",
+                "Split · s",
                 PaletteAction::SetMode(WorkspaceMode::Split),
             ),
             ("Save note", "Ctrl+S", PaletteAction::Save),
@@ -3100,6 +3476,8 @@ impl Notiz {
     }
 
     fn reset_workspace_for_vault(&mut self, snapshot: AppSnapshot) {
+        self.graph_selected = None;
+        self.graph_view_revision = self.graph_view_revision.wrapping_add(1);
         self.open_tabs.clear();
         self.active_tab = None;
         self.selected_folder.clear();
@@ -3153,6 +3531,8 @@ impl Notiz {
                     .cmp(&left.updated_at)
                     .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
             }),
+            // Manual keeps the vault's stored order (note_order positions).
+            TreeSort::Manual => {}
         }
         ordered
     }
@@ -3183,6 +3563,8 @@ impl Notiz {
                         .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
                 }
                 TreeSort::Alphabetical => left.to_lowercase().cmp(&right.to_lowercase()),
+                // Manual keeps the vault's stored order (folder_order positions).
+                TreeSort::Manual => std::cmp::Ordering::Equal,
             });
             for child in children {
                 ordered.push(child.clone());
@@ -3209,6 +3591,8 @@ impl Notiz {
         };
         let target = self.tree_drop_target.take();
         let nest_target = self.tree_nest_target.take();
+        // No row under the cursor => the drop lands in the free area, i.e. Root.
+        let root_drop = target.is_none();
         let horizontal = self.cursor_x - drag.origin_x;
         match drag.item {
             TreeItem::Note(id) => {
@@ -3220,8 +3604,20 @@ impl Notiz {
                 else {
                     return Task::none();
                 };
-                let destination = if horizontal < -26.0 {
-                    folder_parent(&source_folder)
+                // Reorder within the same folder when dropped on a sibling note.
+                if let Some(TreeItem::Note(target_id)) = target.as_ref()
+                    && *target_id != id
+                    && self
+                        .notes
+                        .iter()
+                        .find(|note| note.id == *target_id)
+                        .map(|note| note_folder(&note.relative_path))
+                        == Some(source_folder.clone())
+                {
+                    return self.reorder_notes(id, *target_id);
+                }
+                let destination = if root_drop {
+                    String::new()
                 } else {
                     target
                         .as_ref()
@@ -3269,55 +3665,117 @@ impl Notiz {
                     return Task::none();
                 }
                 let source_parent = folder_parent(&source);
+                // Dropped on a folder row.
+                if let Some(TreeItem::Folder(target_folder)) = target.as_ref()
+                    && target_folder != &source
+                    && !target_folder.starts_with(&format!("{source}/"))
+                {
+                    // A clear push to the right nests the folder inside the target;
+                    // otherwise dropping on a sibling just reorders them.
+                    if horizontal > 24.0 {
+                        return self.move_folder_task(&source, target_folder.clone());
+                    }
+                    if folder_parent(target_folder) == source_parent {
+                        return self.reorder_folders(&source, target_folder);
+                    }
+                }
                 let valid_nest_target = nest_target.filter(|folder| {
                     !folder.is_empty()
                         && folder != &source
                         && !folder.starts_with(&format!("{source}/"))
                 });
-                let destination_parent = if let Some(folder) = valid_nest_target {
-                    if horizontal < -26.0 {
-                        folder_parent(&source_parent)
-                    } else {
-                        folder
-                    }
-                } else if horizontal < -26.0 {
-                    folder_parent(&source_parent)
+                let destination_parent = if root_drop {
+                    String::new()
+                } else if let Some(folder) = valid_nest_target {
+                    folder
                 } else {
-                    match target.as_ref() {
-                        Some(TreeItem::Folder(folder))
-                            if !folder.is_empty()
-                                && folder != &source
-                                && !folder.starts_with(&format!("{source}/"))
-                                && horizontal > 18.0 =>
-                        {
-                            folder.clone()
-                        }
-                        _ => source_parent.clone(),
-                    }
+                    source_parent.clone()
                 };
                 if destination_parent == source_parent {
                     return Task::none();
                 }
-                let services = self.services.clone();
-                let sent_source = source.clone();
-                self.status = if destination_parent.is_empty() {
-                    "Moving folder to Root…".into()
-                } else {
-                    format!("Moving folder into {destination_parent}…")
-                };
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            services.move_folder(&source, &destination_parent)
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .map_err(|error| error.to_string())
-                    },
-                    move |result| Message::TreeFolderMoved(sent_source.clone(), result),
-                )
+                self.move_folder_task(&source, destination_parent)
             }
         }
+    }
+
+    /// Move `source` so its new parent becomes `destination_parent` (empty = Root).
+    fn move_folder_task(&mut self, source: &str, destination_parent: String) -> Task<Message> {
+        let source = source.to_owned();
+        let services = self.services.clone();
+        let sent_source = source.clone();
+        self.status = if destination_parent.is_empty() {
+            "Moving folder to Root…".into()
+        } else {
+            format!("Moving folder into {destination_parent}…")
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    services.move_folder(&source, &destination_parent)
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+            },
+            move |result| Message::TreeFolderMoved(sent_source.clone(), result),
+        )
+    }
+
+    /// Persist a manual note order where `source` is moved to sit just before
+    /// `target` among its siblings. Switches the tree into Manual sort so the
+    /// new arrangement is visible and keeps future automatic sorts from undoing it.
+    fn reorder_notes(&mut self, source: Uuid, target: Uuid) -> Task<Message> {
+        self.tree_sort = TreeSort::Manual;
+        let order: Vec<Uuid> = self
+            .ordered_note_refs(&self.notes)
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        let Some(from) = order.iter().position(|id| *id == source) else {
+            return Task::none();
+        };
+        let Some(target_at) = order.iter().position(|id| *id == target) else {
+            return Task::none();
+        };
+        let order = reorder_indices(&order, from, target_at);
+        let services = self.services.clone();
+        self.status = "Reordering…".into();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || services.save_note_order(&order))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())
+            },
+            Message::TreeOrderSaved,
+        )
+    }
+
+    /// Persist a manual folder order where `source` is moved to sit just before
+    /// `target` among its siblings (both share a parent). The saved order covers
+    /// every folder so sibling positions elsewhere stay intact.
+    fn reorder_folders(&mut self, source: &str, target: &str) -> Task<Message> {
+        self.tree_sort = TreeSort::Manual;
+        let order = self.ordered_folders();
+        let Some(from) = order.iter().position(|f| f == source) else {
+            return Task::none();
+        };
+        let Some(target_at) = order.iter().position(|f| f == target) else {
+            return Task::none();
+        };
+        let order = reorder_indices(&order, from, target_at);
+        let services = self.services.clone();
+        self.status = "Reordering…".into();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || services.save_folder_order(&order))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())
+            },
+            Message::TreeOrderSaved,
+        )
     }
 
     fn tree_item_folder(&self, item: &TreeItem) -> Option<String> {
@@ -3473,11 +3931,87 @@ impl Notiz {
         block.start_line + (within * span as f32).round() as usize
     }
 
+    fn editor_snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            text: self.editor.text(),
+            cursor: self.editor.cursor().position,
+        }
+    }
+
+    /// Records the pre-edit buffer so Ctrl+Z can restore it. iced 0.14's text editor
+    /// has no built-in history, so we snapshot here and coalesce rapid keystrokes
+    /// (within 600ms) into a single undo step.
+    fn capture_undo_snapshot(&mut self) {
+        if self.active_note.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let coalesce = self
+            .last_snapshot_at
+            .is_some_and(|at| now.duration_since(at) < Duration::from_millis(600));
+        self.last_snapshot_at = Some(now);
+        if coalesce {
+            return;
+        }
+        self.redo_stack.clear();
+        self.undo_stack.push(self.editor_snapshot());
+        if self.undo_stack.len() > 200 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn apply_history(&mut self, undo: bool) -> Task<Message> {
+        if self.active_note.is_none() {
+            return Task::none();
+        }
+        let current = self.editor_snapshot();
+        let Some(target) = (if undo {
+            self.undo_stack.pop()
+        } else {
+            self.redo_stack.pop()
+        }) else {
+            return Task::none();
+        };
+        if undo {
+            self.redo_stack.push(current);
+        } else {
+            self.undo_stack.push(current);
+        }
+        self.last_snapshot_at = None;
+        self.editor = text_editor::Content::with_text(&target.text);
+        let line_count = self.editor.line_count().max(1);
+        let line = target.cursor.line.min(line_count.saturating_sub(1));
+        self.editor.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        for _ in 0..line {
+            self.editor
+                .perform(text_editor::Action::Move(text_editor::Motion::Down));
+        }
+        self.editor
+            .perform(text_editor::Action::Move(text_editor::Motion::Home));
+        for _ in 0..target.cursor.column {
+            self.editor
+                .perform(text_editor::Action::Move(text_editor::Motion::Right));
+        }
+        self.selected_line = self.editor.cursor().position.line;
+        self.preview_dirty = true;
+        self.mark_dirty();
+        self.refresh_link_suggestions();
+        iced::widget::operation::focus(note_editor_id())
+    }
+
     fn apply_context(&mut self, context: NoteContext) {
+        self.link_suggestions.clear();
+        self.link_suggestion_selected = 0;
+        self.link_popup_dismissed = false;
         self.title = context.note.title.clone();
         self.tags = context.note.tags.join(", ");
         self.selected_folder = note_folder(&context.note.relative_path);
         self.editor = text_editor::Content::with_text(&context.note.body);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_snapshot_at = None;
         self.preview_blocks = vec![PreviewBlock {
             start_line: 0,
             end_line: 0,
@@ -3641,6 +4175,17 @@ fn vault_path_input_id() -> iced::widget::Id {
     "notiz-vault-path".into()
 }
 
+fn reveal_folder(collapsed: &mut HashSet<String>, folder: &str) {
+    let mut path = String::new();
+    for segment in folder.split('/').filter(|segment| !segment.is_empty()) {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(segment);
+        collapsed.remove(&path);
+    }
+}
+
 fn note_folder(relative_path: &str) -> String {
     Path::new(relative_path)
         .parent()
@@ -3663,6 +4208,23 @@ fn folder_parent(folder: &str) -> String {
         .and_then(|path| path.to_str())
         .unwrap_or_default()
         .replace('\\', "/")
+}
+
+/// Move the item at `from` so it lands next to the item at `to`, picking the
+/// side that matches the drag direction. Dragging downward drops the item
+/// *after* the target; dragging upward drops it *before*. This is what makes
+/// swapping two adjacent siblings actually change their order.
+fn reorder_indices<T: Clone>(items: &[T], from: usize, to: usize) -> Vec<T> {
+    let mut order = items.to_vec();
+    if from >= order.len() || to >= order.len() || from == to {
+        return order;
+    }
+    let moving = order.remove(from);
+    // With the item removed, inserting at the target's original index lands
+    // after it when dragging down (indices above `from` shifted down by one)
+    // and before it when dragging up.
+    order.insert(to.min(order.len()), moving);
+    order
 }
 
 fn shorten(value: &str, max_chars: usize) -> String {
@@ -3821,6 +4383,174 @@ fn coalesce_preview_sources(blocks: Vec<PreviewSource>, max_blocks: usize) -> Ve
         .collect()
 }
 
+fn note_editor_id() -> iced::widget::Id {
+    iced::widget::Id::new("note-editor")
+}
+
+fn link_editor_binding(
+    press: text_editor::KeyPress,
+    has_suggestions: bool,
+    selected: usize,
+) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::{Key, key::Named};
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    if has_suggestions
+        && !press.modifiers.control()
+        && !press.modifiers.alt()
+        && !press.modifiers.logo()
+    {
+        let message = match press.key.as_ref() {
+            Key::Named(Named::Tab) => Some(Message::AcceptLinkSuggestion(selected)),
+            Key::Named(Named::ArrowDown) => Some(Message::MoveLinkSuggestion(1)),
+            Key::Named(Named::ArrowUp) => Some(Message::MoveLinkSuggestion(-1)),
+            Key::Named(Named::Escape) => Some(Message::DismissLinkSuggestions),
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Some(text_editor::Binding::Custom(message));
+        }
+    }
+    text_editor::Binding::from_key_press(press)
+}
+
+fn wikilink_context(editor: &text_editor::Content) -> Option<WikiLinkContext> {
+    let cursor = editor.cursor();
+    if cursor
+        .selection
+        .is_some_and(|selection| selection != cursor.position)
+    {
+        return None;
+    }
+    let line = editor.line(cursor.position.line)?;
+    // Iced's cursor column is a UTF-8 byte index, not a character count.
+    let before = line.text.get(..cursor.position.column)?;
+    let start = before.rfind("[[")? + 2;
+    let query = &before[start..];
+    if query.contains(['[', ']', '|', '#', '\n', '\r']) {
+        return None;
+    }
+    // Escaped brackets and inline code are literal Markdown, not link requests.
+    if before[..start - 2]
+        .chars()
+        .rev()
+        .take_while(|c| *c == '\\')
+        .count()
+        % 2
+        != 0
+        || before[..start - 2].matches('`').count() % 2 != 0
+    {
+        return None;
+    }
+    let mut fenced = false;
+    for index in 0..cursor.position.line {
+        let previous = editor.line(index)?;
+        let previous = previous.text.trim_start();
+        if previous.starts_with("```") || previous.starts_with("~~~") {
+            fenced = !fenced;
+        }
+    }
+    if fenced {
+        return None;
+    }
+    let after = line.text.get(cursor.position.column..)?;
+    let mut end = cursor.position.column;
+    let mut suffix = String::new();
+    if let Some(close) = after.find("]]") {
+        let rest = &after[..close];
+        if !rest.contains(['[', ']']) {
+            end += close + 2;
+            if let Some(index) = rest.find(['#', '|']) {
+                suffix = rest[index..].to_owned();
+            }
+        }
+    }
+    Some(WikiLinkContext {
+        line: cursor.position.line,
+        start,
+        end,
+        query: query.to_owned(),
+        suffix,
+    })
+}
+
+fn wikilink_suggestions(
+    editor: &text_editor::Content,
+    notes: &[NoteSummary],
+) -> Vec<LinkSuggestion> {
+    let Some(context) = wikilink_context(editor) else {
+        return Vec::new();
+    };
+    let query = context.query.trim().to_lowercase();
+    let mut matches = notes
+        .iter()
+        .filter(|note| {
+            !note.title.contains(['[', ']', '|', '#', '\n', '\r'])
+                && (note.title.to_lowercase().contains(&query)
+                    || note.relative_path.to_lowercase().contains(&query))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|note| {
+        let title = note.title.to_lowercase();
+        (
+            if title == query {
+                0
+            } else if title.starts_with(&query) {
+                1
+            } else {
+                2
+            },
+            title,
+            note.relative_path.clone(),
+        )
+    });
+    matches
+        .into_iter()
+        .take(6)
+        .map(|note| {
+            let duplicate = notes
+                .iter()
+                .filter(|other| other.title.to_lowercase() == note.title.to_lowercase())
+                .count()
+                > 1;
+            let target = if duplicate {
+                note.relative_path
+                    .strip_suffix(".md")
+                    .unwrap_or(&note.relative_path)
+                    .to_owned()
+            } else {
+                note.title.clone()
+            };
+            LinkSuggestion {
+                title: note.title.clone(),
+                path: note.relative_path.clone(),
+                target,
+            }
+        })
+        .collect()
+}
+
+fn complete_wikilink(editor: &mut text_editor::Content, target: &str) -> bool {
+    let Some(context) = wikilink_context(editor) else {
+        return false;
+    };
+    editor.move_to(text_editor::Cursor {
+        position: text_editor::Position {
+            line: context.line,
+            column: context.start,
+        },
+        selection: Some(text_editor::Position {
+            line: context.line,
+            column: context.end,
+        }),
+    });
+    editor.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+        std::sync::Arc::new(format!("{target}{}]]", context.suffix)),
+    )));
+    true
+}
+
 fn internal_link_target(uri: &str) -> Option<String> {
     uri.strip_prefix("notiz://")
         .map(|target| target.replace("%20", " "))
@@ -3854,6 +4584,11 @@ fn window_events(
                 }
                 Key::Character("k") if modifiers.control() => Some(Message::TogglePalette),
                 Key::Character("p") if modifiers.control() => Some(Message::TogglePalette),
+                Key::Character("z" | "Z") if modifiers.control() && modifiers.shift() => {
+                    Some(Message::Redo)
+                }
+                Key::Character("z" | "Z") if modifiers.control() => Some(Message::Undo),
+                Key::Character("y" | "Y") if modifiers.control() => Some(Message::Redo),
                 Key::Character("n")
                     if modifiers.control() && status == iced::event::Status::Ignored =>
                 {
@@ -3865,6 +4600,31 @@ fn window_events(
                     Some(Message::SaveRequested)
                 }
                 Key::Character("f") if modifiers.control() => Some(Message::ToggleNoteSearch),
+                // Vim-like view switch: only when nothing is capturing the key (reading mode).
+                Key::Character("i" | "e")
+                    if !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && status == iced::event::Status::Ignored =>
+                {
+                    Some(Message::VimMode(WorkspaceMode::Editor))
+                }
+                Key::Character("r")
+                    if !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && status == iced::event::Status::Ignored =>
+                {
+                    Some(Message::VimMode(WorkspaceMode::Preview))
+                }
+                Key::Character("s")
+                    if !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && status == iced::event::Status::Ignored =>
+                {
+                    Some(Message::VimMode(WorkspaceMode::Split))
+                }
                 Key::Named(Named::Escape) => Some(Message::CancelCreators),
                 Key::Named(Named::ArrowUp) => Some(Message::PaletteMove(-1)),
                 Key::Named(Named::ArrowDown) => Some(Message::PaletteMove(1)),
@@ -3905,6 +4665,303 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    fn editor_at(text: &str, column: usize) -> text_editor::Content {
+        let mut editor = text_editor::Content::with_text(text);
+        editor.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column },
+            selection: None,
+        });
+        editor
+    }
+
+    #[test]
+    fn undo_and_redo_restore_the_editor_buffer_within_the_active_note() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        let typed = ['H', 'i'];
+        for ch in typed {
+            let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+                text_editor::Edit::Insert(ch),
+            )));
+            // Space out keystrokes so each one is its own undo step.
+            app.last_snapshot_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(800));
+        }
+        assert_eq!(app.editor.text(), "Hi");
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.editor.text(), "H");
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.editor.text(), "");
+        let _ = app.update(Message::Redo);
+        assert_eq!(app.editor.text(), "H");
+        let _ = app.update(Message::Redo);
+        assert_eq!(app.editor.text(), "Hi");
+        // Nothing left to redo; the buffer stays put.
+        let _ = app.update(Message::Redo);
+        assert_eq!(app.editor.text(), "Hi");
+    }
+
+    #[test]
+    fn wikilink_completion_preserves_unicode_surrounding_text_and_existing_closer() {
+        for (text, column, expected) in [
+            ("Olá [[Sé", "Olá [[Sé".len(), "Olá [[Sessão]]"),
+            ("[[Se]] depois", 4, "[[Sessão]] depois"),
+            ("[[Se resto]] depois", 4, "[[Sessão]] depois"),
+            (
+                "[[Se#Título|rótulo]] depois",
+                4,
+                "[[Sessão#Título|rótulo]] depois",
+            ),
+            ("[[", 2, "[[Sessão]]"),
+        ] {
+            let mut editor = editor_at(text, column);
+            assert!(complete_wikilink(&mut editor, "Sessão"));
+            assert_eq!(editor.text(), expected);
+            let cursor = editor.cursor().position;
+            assert_eq!(
+                &editor.line(0).unwrap().text[..cursor.column],
+                expected.split(" depois").next().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn wikilink_context_ignores_closed_links_aliases_code_and_selections() {
+        for text in [
+            "plain text",
+            "[[Done]]",
+            "[[Note|alias",
+            "[[Note#heading",
+            "\\[[literal",
+            "`[[code",
+        ] {
+            let editor = editor_at(text, text.len());
+            assert!(wikilink_context(&editor).is_none(), "{text}");
+        }
+        let mut editor = editor_at("[[selected", 10);
+        editor.perform(text_editor::Action::Select(text_editor::Motion::Home));
+        assert!(wikilink_context(&editor).is_none());
+        let mut editor = text_editor::Content::with_text("```md\n[[code\n```");
+        editor.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 1, column: 6 },
+            selection: None,
+        });
+        assert!(wikilink_context(&editor).is_none());
+    }
+
+    #[test]
+    fn wikilink_suggestions_rank_prefixes_and_disambiguate_duplicate_titles() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        app.apply_snapshot(
+            app.services
+                .create_note_in("Second", "Projects")
+                .unwrap()
+                .snapshot,
+        );
+        let suggestions = wikilink_suggestions(&editor_at("[[sec", 5), &app.notes);
+        assert_eq!(suggestions.len(), 2);
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| suggestion.target != "Second")
+        );
+        for suggestion in suggestions {
+            let id = app.services.resolve_link(&suggestion.target).unwrap();
+            assert!(id.is_some());
+            assert_eq!(
+                app.services
+                    .load_note(id.unwrap())
+                    .unwrap()
+                    .note
+                    .relative_path,
+                suggestion.path
+            );
+        }
+        let suggestions = wikilink_suggestions(&editor_at("[[proj", 6), &app.notes);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].path, "Projects/second.md");
+        assert!(wikilink_suggestions(&editor_at("[[not-found", 11), &app.notes).is_empty());
+    }
+
+    #[test]
+    fn accepting_link_marks_dirty_and_escape_dismissal_survives_navigation() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new("[[Sec".into())),
+        )));
+        assert_eq!(app.link_suggestions.len(), 1);
+        let revision = app.revision;
+        let _ = app.update(Message::AcceptLinkSuggestion(0));
+        assert_eq!(app.editor.text(), "[[Second]]");
+        assert!(app.dirty && app.preview_dirty);
+        assert!(app.revision > revision);
+        assert!(app.link_suggestions.is_empty());
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new(" [[".into())),
+        )));
+        assert!(!app.link_suggestions.is_empty());
+        let _ = app.update(Message::DismissLinkSuggestions);
+        let _ = app.update(Message::EditorAction(text_editor::Action::Move(
+            text_editor::Motion::Left,
+        )));
+        assert!(app.link_suggestions.is_empty());
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Insert('['),
+        )));
+        assert!(!app.link_suggestions.is_empty());
+    }
+
+    #[test]
+    fn tab_and_arrows_complete_only_when_editor_has_suggestions_and_focus() {
+        use iced::keyboard::{
+            Key, Modifiers,
+            key::{Code, Named, Physical},
+        };
+        let press = |key, status| text_editor::KeyPress {
+            key: Key::Named(key),
+            modified_key: Key::Named(key),
+            physical_key: Physical::Code(Code::Tab),
+            modifiers: Modifiers::empty(),
+            text: None,
+            status,
+        };
+        let focused = text_editor::Status::Focused { is_hovered: false };
+        assert!(matches!(
+            link_editor_binding(press(Named::Tab, focused), true, 2),
+            Some(text_editor::Binding::Custom(Message::AcceptLinkSuggestion(
+                2
+            )))
+        ));
+        assert!(matches!(
+            link_editor_binding(press(Named::ArrowDown, focused), true, 0),
+            Some(text_editor::Binding::Custom(Message::MoveLinkSuggestion(1)))
+        ));
+        assert!(matches!(
+            link_editor_binding(press(Named::Escape, focused), true, 0),
+            Some(text_editor::Binding::Custom(
+                Message::DismissLinkSuggestions
+            ))
+        ));
+        assert!(!matches!(
+            link_editor_binding(press(Named::Tab, focused), false, 0),
+            Some(text_editor::Binding::Custom(_))
+        ));
+        assert!(
+            link_editor_binding(press(Named::Tab, text_editor::Status::Active), true, 0).is_none()
+        );
+    }
+
+    #[test]
+    fn creators_reveal_nested_folders_and_expand_the_sidebar() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        app.apply_snapshot(app.services.create_folder("Parent/Child").unwrap());
+        for is_folder in [false, true] {
+            app.collapsed_folders = HashSet::from(["Parent".into(), "Parent/Child".into()]);
+            app.sidebar_collapsed = true;
+            app.search = "no results".into();
+            app.visible_notes.clear();
+            let action = if is_folder {
+                Message::OpenFolderCreator("Parent/Child".into())
+            } else {
+                Message::CreateNoteIn("Parent/Child".into())
+            };
+            let _ = app.update(action);
+            assert!(!app.sidebar_collapsed);
+            assert!(app.search.is_empty());
+            assert_eq!(app.visible_notes.len(), app.notes.len());
+            assert!(app.collapsed_folders.is_empty());
+            assert_eq!(app.folder_creator_open, is_folder);
+            assert_eq!(app.note_creator_open, !is_folder);
+            let _ = app.update(Message::CancelCreators);
+            assert!(!app.folder_creator_open && !app.note_creator_open);
+        }
+    }
+
+    #[test]
+    fn manual_sort_honors_stored_folder_and_note_order() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        app.apply_snapshot(app.services.create_folder("Alpha").unwrap());
+        app.apply_snapshot(app.services.create_folder("Beta").unwrap());
+        app.apply_snapshot(app.services.create_folder("Gamma").unwrap());
+
+        // reorder_folders picks Manual mode and computes [Gamma, Alpha, Beta].
+        let _ = app.reorder_folders("Gamma", "Alpha");
+        assert_eq!(app.tree_sort, TreeSort::Manual);
+
+        // Persist that custom order through the service and confirm the tree honors it.
+        app.apply_snapshot(
+            app.services
+                .save_folder_order(&["Gamma".into(), "Alpha".into(), "Beta".into()])
+                .unwrap(),
+        );
+        assert_eq!(
+            app.ordered_folders(),
+            vec!["Gamma".to_string(), "Alpha".into(), "Beta".into()]
+        );
+
+        // Dragging a folder DOWN onto a lower sibling must move it past that
+        // sibling (the direction that previously no-op'd), proven by the pure
+        // reorder helper below.
+        let ids = [1usize, 2, 3];
+        assert_eq!(reorder_indices(&ids, 0, 2), vec![2, 3, 1]); // drag 1 down past 3
+        assert_eq!(reorder_indices(&ids, 2, 0), vec![3, 1, 2]); // drag 3 up before 1
+
+        // A custom note order is honored too under Manual sort.
+        let ids: Vec<Uuid> = app.notes.iter().map(|n| n.id).rev().collect();
+        app.apply_snapshot(app.services.save_note_order(&ids).unwrap());
+        let shown: Vec<Uuid> = app.ordered_visible_notes().iter().map(|n| n.id).collect();
+        assert_eq!(shown, ids);
+    }
+
+    #[test]
+    fn root_drop_moves_a_nested_folder_back_to_the_vault_root() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        app.apply_snapshot(app.services.create_folder("Alpha/Beta").unwrap());
+        assert!(app.folders.iter().any(|f| f == "Alpha/Beta"));
+
+        app.tree_drag = Some(TreeDrag {
+            item: TreeItem::Folder("Alpha/Beta".into()),
+            origin_x: app.cursor_x,
+            active: true,
+        });
+        // No row under the cursor => drop in the free area => Root.
+        app.tree_drop_target = None;
+        let _ = app.finish_tree_interaction();
+        // The drop target resolved to Root and the move kicked off.
+        assert_eq!(app.status, "Moving folder to Root…");
+        assert!(app.tree_drag.is_none());
+
+        // The underlying move the task performs lands the folder at the root.
+        app.apply_snapshot(app.services.move_folder("Alpha/Beta", "").unwrap().snapshot);
+        assert!(app.folders.iter().any(|f| f == "Beta"));
+        assert!(!app.folders.iter().any(|f| f == "Alpha/Beta"));
+    }
+
+    #[test]
+    fn palette_is_generic_and_folder_creation_targets_root() {
+        let mut workspace = TestWorkspace::new();
+        let app = &mut workspace.app;
+        let entries = app.palette_entries();
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.action,
+            PaletteAction::CreateFromTemplate(NoteTemplate::Session | NoteTemplate::Memory)
+        )));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.action, PaletteAction::CreateFolder))
+        );
+        app.selected_folder = "Somewhere".into();
+        let _ = app.update(Message::PaletteExecute(PaletteAction::CreateFolder));
+        assert!(app.folder_creator_open);
+        assert!(app.selected_folder.is_empty());
     }
 
     #[test]
